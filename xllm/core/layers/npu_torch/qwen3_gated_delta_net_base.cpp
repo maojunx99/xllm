@@ -440,9 +440,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     torch::Tensor ssm_state_indices = 
         attn_metadata.block_table.select(1, 0).contiguous();
     
-    // Todo: 使用 q_lens
-    torch::Tensor actual_seq_lengths = torch::ones(
-        processed_q.size(0), torch::dtype(torch::kInt32).device(processed_q.device()));
+    torch::Tensor actual_seq_lengths = attn_metadata.q_seq_lens.clone();
     double scale = 1.0 / std::sqrt(static_cast<float>(processed_q.size(-1)));
     core_attn_out = 
         at_npu::native::custom_ops::npu_recurrent_gated_delta_rule(
