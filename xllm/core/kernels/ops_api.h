@@ -94,6 +94,9 @@ void fused_indexer_q(FusedIndexerQParams& params);
 
 void fused_indexer_k(FusedIndexerKParams& params);
 
+// L2 normalization along the last dimension
+torch::Tensor l2_norm(torch::Tensor& x, double eps = 1e-6);
+
 // TODO: NPU moe_init_routing_v2 is equivalent to moe_gen_idx + moe_expand_input
 // (and token_count/cusum outputs) on other backends.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -132,6 +135,7 @@ std::pair<torch::Tensor, torch::Tensor> fused_recurrent_gated_delta_rule(
     FusedRecurrentGatedDeltaRuleParams& params);
 
 torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params);
+torch::Tensor causal_conv1d_update_v2(CausalConv1dUpdateV2Params& params);
 
 torch::Tensor gated_layer_norm(GatedLayerNormParams& params);
 

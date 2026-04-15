@@ -755,6 +755,14 @@ void fused_indexer_k(FusedIndexerKParams& params) {
 #endif
 }
 
+torch::Tensor l2_norm(torch::Tensor& x, double eps) {
+#if defined(USE_NPU)
+  return npu::npu_l2norm_last_dim(x, eps);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moe_init_routing_v2(MoeInitRoutingV2Params& params) {
 #if defined(USE_NPU)
@@ -932,6 +940,26 @@ torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params) {
 #endif
 }
 
+torch::Tensor causal_conv1d_update_v2(CausalConv1dUpdateV2Params& params) {
+#if defined(USE_NPU)
+  return npu::npu_causal_conv1d_update_v2(params.x,
+                                          params.conv_state,
+                                          params.weight,
+                                          params.activation,
+                                          params.bias,
+                                          params.conv_state_indices,
+                                          params.query_start_loc,
+                                          params.max_query_len,
+                                          params.pad_slot_id,
+                                          params.block_idx_last_scheduled_token,
+                                          params.initial_state_idx,
+                                          params.validate_data);
+
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 torch::Tensor gated_layer_norm(GatedLayerNormParams& params) {
 #if defined(USE_NPU)
   return npu::layer_norm_fwd(params.x,
@@ -971,6 +999,11 @@ fused_qkvzba_split_reshape_cat(FusedQkvzbaSplitReshapeParams& params) {
                                                  params.num_heads_v,
                                                  params.head_qk,
                                                  params.head_v);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
     ChunkGatedDeltaRuleParams& params) {
 #if defined(USE_NPU)
