@@ -25,4 +25,5 @@ cc_library(
     qwen3_5_decoder_layer_impl.cpp
   DEPS
     :common_layers
+    $<$<BOOL:${USE_NPU}>:xllm_ops>
 )
