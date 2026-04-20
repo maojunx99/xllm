@@ -36,17 +36,17 @@ limitations under the License.
 namespace xllm::kernel::npu {
 
 torch::Tensor recurrent_gated_delta_rule(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    at::Tensor& state,
-    const c10::optional<at::Tensor>& beta,
-    const c10::optional<double> scale,
-    const c10::optional<at::Tensor>& actual_seq_lengths,
-    const c10::optional<at::Tensor>& ssm_state_indices,
-    const c10::optional<at::Tensor>& num_accepted_tokens,
-    const c10::optional<at::Tensor>& g,
-    const c10::optional<at::Tensor>& gk) {
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    torch::Tensor& state,
+    const std::optional<torch::Tensor>& beta,
+    const std::optional<double> scale,
+    const std::optional<torch::Tensor>& actual_seq_lengths,
+    const std::optional<torch::Tensor>& ssm_state_indices,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const std::optional<torch::Tensor>& g,
+    const std::optional<torch::Tensor>& gk) {
   check_tensor(query, "query", "recurrent_gated_delta_rule");
   check_tensor(key, "key", "recurrent_gated_delta_rule");
   check_tensor(value, "value", "recurrent_gated_delta_rule");

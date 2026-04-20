@@ -437,15 +437,16 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     std::tie(core_attn_out, last_recurrent_state) =
         xllm::kernel::chunk_gated_delta_rule(chunk_gated_delta_params);
     ssm_cache.index_put_(
-        {input_params.block_tables.select(1, 0)},
+        {linear_state_indices},
         last_recurrent_state.transpose(-1, -2).to(ssm_cache.dtype()));
   } else {
     processed_q = xllm::kernel::l2_norm(processed_q, 1e-6);
     processed_k = xllm::kernel::l2_norm(processed_k, 1e-6);
     torch::Tensor ssm_state_indices =
         attn_metadata.block_table.select(1, 0).contiguous();
-    auto zero = torch::zeros({1},attn_metadata.q_seq_lens.options());
-    torch::Tensor actual_seq_lengths = torch::cat({zero, attn_metadata.q_seq_lens}, 0);
+    auto zero = torch::zeros({1}, attn_metadata.q_seq_lens.options());
+    torch::Tensor actual_seq_lengths =
+        torch::cat({zero, attn_metadata.q_seq_lens}, 0);
     double scale = 1.0 / std::sqrt(static_cast<float>(processed_q.size(-1)));
     core_attn_out = xllm::kernel::recurrent_gated_delta_rule(
                         processed_q.reshape(
