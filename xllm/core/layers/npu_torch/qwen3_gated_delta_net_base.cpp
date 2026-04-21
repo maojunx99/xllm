@@ -359,30 +359,28 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   auto device = mixed_qkv.device();
   auto conv_weight = conv1d_->weight();
   auto linear_state_indices = get_linear_state_indices(input_params, device);
-
   if (attn_metadata.is_prefill) {
-    mixed_qkv = mixed_qkv.transpose(1, 2);
-    torch::Tensor conv_state =
-        (seq_len < conv_kernel_size_ - 1)
-            ? torch::pad(mixed_qkv, {0, conv_kernel_size_ - 1 - seq_len})
-        : (seq_len > conv_kernel_size_ - 1)
-            ? mixed_qkv.narrow(
-                  -1, seq_len - conv_kernel_size_ + 1, conv_kernel_size_ - 1)
-            : mixed_qkv;
-    conv_state = conv_state.transpose(1, 2).contiguous();
-    conv_cache.index_put_({linear_state_indices},
-                          conv_state.to(conv_cache.dtype()));
-    torch::Tensor bias;
-    auto conv_output =
-        torch::conv1d(mixed_qkv,
-                      conv_weight.unsqueeze(1).to(device),
-                      bias,
-                      /*stride=*/std::vector<int64_t>{1},
-                      /*padding=*/std::vector<int64_t>{3},
-                      /*dilation=*/std::vector<int64_t>{1},
-                      /*groups=*/static_cast<int64_t>(mixed_qkv.size(1)));
-    mixed_qkv = torch::silu(conv_output.slice(2, 0, seq_len));
+    at::IntArrayRef num_accepted_tokens_opt;
+    torch::Tensor conv_weight_T = conv_weight.transpose(0, 1).contiguous();
+    mixed_qkv = xllm::kernel::causal_conv1d(
+        mixed_qkv,
+        conv_weight_T,
+        conv_cache,
+        std::optional<torch::Tensor>(),  // bias (no bias for qwen3)
+        at::IntArrayRef(input_params.query_start_loc),
+        at::IntArrayRef(input_params.cache_indices),
+        at::IntArrayRef(input_params.has_initial_state),
+        num_accepted_tokens_opt,
+        1,
+        -1,  // pad_slot_id
+        0    // run mode  0:fn, 1:update
+    );
 
+    // Transpose output back to [batch_size, seqLen, dim] for downstream
+    // processing
+    mixed_qkv =
+        mixed_qkv.view({batch_size, -1, mixed_qkv.size(-1)}).contiguous();
+    mixed_qkv = mixed_qkv.transpose(1, 2);
   } else {
     xllm::kernel::CausalConv1dUpdateParams conv1d_params;
     conv1d_params.x = mixed_qkv.reshape({-1, mixed_qkv.size(-1)});

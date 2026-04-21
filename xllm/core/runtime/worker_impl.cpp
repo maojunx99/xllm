@@ -523,6 +523,40 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
         // expert_load_data_.fill_(0);
         processed_input.input_params.expert_load_data = expert_load_data_;
       }
+
+    int64_t batch_size = processed_input.input_params.block_tables.size(0);
+ 	   processed_input.input_params.query_start_loc.resize(batch_size + 1, 0);
+ 	   int64_t cumsum = 0;
+ 	   for (int64_t i = 0; i < batch_size; ++i) {
+ 	     int64_t seq_len =
+ 	         processed_input.input_params.q_seq_lens[i].item<int64_t>();
+ 	     cumsum += seq_len;
+ 	     processed_input.input_params.query_start_loc[i + 1] = cumsum;
+ 	   }
+ 	 
+ 	   torch::Tensor selected_col =
+ 	       processed_input.input_params.block_tables.select(1, 0)
+ 	           .contiguous()
+ 	           .to(torch::kCPU)
+ 	           .to(torch::kInt64);
+ 	   std::vector<int64_t> cache_indices(
+ 	       selected_col.data_ptr<int64_t>(),
+ 	       selected_col.data_ptr<int64_t>() + selected_col.size(0));
+ 	   processed_input.input_params.cache_indices = cache_indices;
+ 	 
+ 	   torch::Tensor has_initial_state_tensor =
+ 	       processed_input.input_params.kv_seq_lens > 0;
+         
+ 	   auto has_initial_state_int64 =
+ 	       has_initial_state_tensor.contiguous().to(torch::kCPU).to(torch::kInt64);
+ 	   std::vector<int64_t> has_initial_state(
+ 	       has_initial_state_int64.data_ptr<int64_t>(),
+ 	       has_initial_state_int64.data_ptr<int64_t>() +
+ 	           has_initial_state_int64.size(0));
+ 	   processed_input.input_params.has_initial_state = has_initial_state;
+ 	   std::vector<int64_t> num_accepted_tokens_opt(cache_indices.size(), 0);
+ 	   processed_input.input_params.num_accepted_tokens_opt =
+ 	       num_accepted_tokens_opt;
     }
 #endif
   };

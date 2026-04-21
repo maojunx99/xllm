@@ -20,6 +20,7 @@ cc_library(
     npu_moe_init_routing_v2.cpp
     npu_moe_token_unpermute.cpp
     rope.cpp
+    npu_causal_conv1d.cpp
   DEPS
     :torch_npu_kernels
     :tilelang_kernels
