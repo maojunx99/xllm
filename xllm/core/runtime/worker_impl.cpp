@@ -442,6 +442,33 @@ ForwardInput WorkerImpl::update_input_by_last_step_output(
   return inputs;
 }
 
+void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
+  int64_t batch_size = input_params.block_tables.size(0);
+  input_params.query_start_loc.resize(batch_size + 1, 0);
+  int64_t cumsum = 0;
+  for (int64_t i = 0; i < batch_size; ++i) {
+    int64_t seq_len = input_params.q_seq_lens[i].item<int64_t>();
+    cumsum += seq_len;
+    input_params.query_start_loc[i + 1] = cumsum;
+  }
+
+  torch::Tensor selected_col = input_params.block_tables.select(1, 0)
+                                   .contiguous()
+                                   .to(torch::kCPU)
+                                   .to(torch::kInt64);
+  input_params.cache_indices = std::vector<int64_t>(
+      selected_col.data_ptr<int64_t>(),
+      selected_col.data_ptr<int64_t>() + selected_col.size(0));
+
+  torch::Tensor has_initial_state_tensor = input_params.kv_seq_lens > 0;
+  torch::Tensor has_initial_state_int64 =
+      has_initial_state_tensor.contiguous().to(torch::kCPU).to(torch::kInt64);
+  input_params.has_initial_state =
+      std::vector<int64_t>(has_initial_state_int64.data_ptr<int64_t>(),
+                           has_initial_state_int64.data_ptr<int64_t>() +
+                               has_initial_state_int64.size(0));
+}
+
 void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                                              ForwardInput& processed_input) {
 #if defined(USE_NPU)
@@ -519,6 +546,10 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
       if (FLAGS_enable_eplb) {
         // expert_load_data_.fill_(0);
         processed_input.input_params.expert_load_data = expert_load_data_;
+      }
+
+      if (has_linear_attention_layers(context_.get_model_args())) {
+        prepare_input_params_for_linear_attention(processed_input.input_params);
       }
     }
 #endif
