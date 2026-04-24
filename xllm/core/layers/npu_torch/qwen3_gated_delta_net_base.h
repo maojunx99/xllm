@@ -81,6 +81,7 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
   ColumnParallelLinear conv1d_{nullptr};
   RowParallelLinear o_proj_{nullptr};
   RmsNormGated norm_{nullptr};
+  torch::Tensor conv_weight_T_{nullptr};
 
   DEFINE_WEIGHT(dt_bias);
   DEFINE_WEIGHT(A_log);

@@ -304,6 +304,7 @@ void Qwen3GatedDeltaNetBaseImpl::load_common_state_dict(
   if (auto w = state_dict.get_tensor("conv1d.weight"); w.defined()) {
     conv1d_->load_state_dict(
         StateDict({{"weight", w.squeeze(1)}}), shard_tensor_count, shard_sizes);
+    conv_weight_T_ = conv1d_->weight().transpose(0, 1).contiguous();
   }
   o_proj_->load_state_dict(state_dict.get_dict_with_prefix("out_proj."));
   if (auto w = state_dict.get_tensor("norm.weight"); w.defined()) {
@@ -387,7 +388,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     xllm::kernel::CausalConv1dUpdateParams conv1d_params;
     conv1d_params.x = mixed_qkv.reshape({-1, mixed_qkv.size(-1)});
     conv1d_params.conv_state = conv_cache;
-    conv1d_params.weight = conv_weight;
+    conv1d_params.weight = conv_weight_T_;
     conv1d_params.conv_state_indices = linear_state_indices;
     conv1d_params.block_idx_last_scheduled_token =
         std::optional<torch::Tensor>();
