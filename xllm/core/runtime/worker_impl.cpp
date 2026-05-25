@@ -262,9 +262,12 @@ bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
       .enable_kv_cache_quant(enable_kv_cache_quant);
 
   allocate_kv_caches(kv_caches_, kv_cache_shape, create_options);
-  linear_state_checkpoint_mgr_ = std::make_unique<LinearStateCheckpointManager>(
-      kv_caches_, device_.index(), options_.max_seqs_per_batch());
-  linear_state_checkpoint_mgr_->initialize();
+  if (enable_linear_attention) {
+    linear_state_checkpoint_mgr_ =
+        std::make_unique<LinearStateCheckpointManager>(
+            kv_caches_, device_.index(), options_.max_seqs_per_batch());
+    linear_state_checkpoint_mgr_->initialize();
+  }
 
 #if defined(USE_CUDA)
   refresh_cuda_block_copy_runtime_state();
@@ -317,6 +320,8 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
 
   // create a KVCache for each layer
   const int64_t num_layers = context_.get_model_args().n_layers();
+  const bool enable_linear_attention =
+      has_linear_attention_layers(context_.get_model_args());
   kv_caches_.reserve(num_layers);
   if (is_spec_draft_) {
     kv_cache_transfer_->allocate_kv_cache_spec(
@@ -325,9 +330,12 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
     kv_cache_transfer_->allocate_kv_cache(
         kv_caches_, num_layers, kv_cache_shape, dtype_);
   }
-  linear_state_checkpoint_mgr_ = std::make_unique<LinearStateCheckpointManager>(
-      kv_caches_, device_.index(), options_.max_seqs_per_batch());
-  linear_state_checkpoint_mgr_->initialize();
+  if (enable_linear_attention) {
+    linear_state_checkpoint_mgr_ =
+        std::make_unique<LinearStateCheckpointManager>(
+            kv_caches_, device_.index(), options_.max_seqs_per_batch());
+    linear_state_checkpoint_mgr_->initialize();
+  }
 
   init_hierarchy_kv_cache_transfer();
   status_ = Status::READY;
@@ -569,16 +577,18 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
 
     if (has_linear_attention_layers(context_.get_model_args())) {
       prepare_input_params_for_linear_attention(processed_input.input_params);
-      linear_state_checkpoint_mgr_->evict(
-          processed_input.input_params.linear_state_evict_prefix_hashes);
-      auto actions = linear_state_checkpoint_mgr_->restore(
-          processed_input.input_params.linear_state_cache_ops);
-      for (size_t i = 0; i < actions.size(); ++i) {
-        if (actions[i] ==
-                LinearStateCheckpointManager::RestoreAction::CONTINUED ||
-            actions[i] ==
-                LinearStateCheckpointManager::RestoreAction::RESTORED) {
-          processed_input.input_params.has_initial_state[i] = 1;
+      if (linear_state_checkpoint_mgr_ != nullptr) {
+        linear_state_checkpoint_mgr_->evict(
+            processed_input.input_params.linear_state_evict_prefix_hashes);
+        auto actions = linear_state_checkpoint_mgr_->restore(
+            processed_input.input_params.linear_state_cache_ops);
+        for (size_t i = 0; i < actions.size(); ++i) {
+          if (actions[i] ==
+                  LinearStateCheckpointManager::RestoreAction::CONTINUED ||
+              actions[i] ==
+                  LinearStateCheckpointManager::RestoreAction::RESTORED) {
+            processed_input.input_params.has_initial_state[i] = 1;
+          }
         }
       }
     }
@@ -735,11 +745,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
     auto step_and_save_linear_state =
         [this](ForwardInput& fwd_input) -> std::optional<ForwardOutput> {
       auto output = this->step(fwd_input);
-      auto result = this->linear_state_checkpoint_mgr_->save(
-          fwd_input.input_params.linear_state_cache_ops);
-      if (output.has_value()) {
-        output->linear_state_evicted_prefix_hashes =
-            std::move(result.evicted_prefix_hashes);
+      if (this->linear_state_checkpoint_mgr_ != nullptr) {
+        auto result = this->linear_state_checkpoint_mgr_->save(
+            fwd_input.input_params.linear_state_cache_ops);
+        if (output.has_value()) {
+          output->linear_state_evicted_prefix_hashes =
+              std::move(result.evicted_prefix_hashes);
+        }
       }
       return output;
     };
