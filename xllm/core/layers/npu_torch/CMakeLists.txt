@@ -42,4 +42,5 @@ cc_library(
     :npu_layers
     :xllm_ops
     :triton_adapter
+    torch_npu
 )

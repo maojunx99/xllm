@@ -46,6 +46,9 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
+namespace npu {
+struct AclGraphTaskUpdateContext;
+}  // namespace npu
 namespace layer {
 struct AttentionMetadata;
 }  // namespace layer
@@ -1024,6 +1027,15 @@ struct ModelInputParams {
   torch::Tensor num_accepted_tokens;
   torch::Tensor dsa_topk_indices;
 
+  // Stable int64 host linear state ids for kernels that take IntArrayRef.
+  std::vector<int64_t> linear_state_indices_host;
+  // Stable int64 host accepted-token counts for ACL graph task update.
+  std::vector<int64_t> num_accepted_tokens_host;
+  // cumulative lengths per query
+  std::vector<int64_t> query_start_loc;
+  // if each sequence has initial conv state, for conv1d
+  std::vector<int64_t> has_initial_state;
+
   RecModelInputParams rec_params;
 
   // dit input data
@@ -1083,6 +1095,20 @@ struct ModelInputParams {
     return std::get<LlmRecMultiRoundParams>(rec_params);
   }
 
+  struct GraphBuffer {
+    torch::Tensor attn_mask;
+    torch::Tensor tiling_data;
+#if defined(USE_NPU)
+    std::shared_ptr<npu::AclGraphTaskUpdateContext>
+        acl_graph_task_update_context;
+#endif
+    bool use_expanded_decode_for_spec_verify_attention = false;
+    torch::Tensor expanded_kv_seq_lens;
+    torch::Tensor expanded_block_tables;
+    torch::Tensor expanded_tiling_data;
+    std::vector<int32_t> expanded_kv_seq_lens_vec;
+  };
+  GraphBuffer graph_buffer;
   // Optional attention metadata, built by executor
   // Using shared_ptr with forward declaration to avoid circular dependency
   std::shared_ptr<layer::AttentionMetadata> attn_metadata;

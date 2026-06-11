@@ -203,8 +203,7 @@ LLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
 std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const ForwardInput& input,
     ForwardSyncPolicy sync_policy) {
-  MULTI_MODEL_STEP_LOCK(::xllm::KVCacheConfig::get_instance().enable_xtensor());
-
+  MULTI_MODEL_STEP_LOCK(FLAGS_enable_xtensor);
   Timer timer;
   auto& sampling_params = input.sampling_params;
 
@@ -362,7 +361,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       }
     }
   }
-
   MULTI_MODEL_STEP_UNLOCK();
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     output.retained_input = std::make_shared<ForwardInput>(input);
@@ -372,7 +370,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     return output;
   }
   auto ret = device_.synchronize_default_stream();
-
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
     auto results =

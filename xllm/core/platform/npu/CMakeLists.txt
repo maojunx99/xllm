@@ -6,8 +6,11 @@ cc_library(
   HDRS
     npu_layer_synchronizer.h
     device_capture_lock.h
+    acl_graph_task_update_context.h
+    npu_external_event.h
   SRCS
     npu_layer_synchronizer.cpp
+    npu_external_event.cpp
   DEPS
     torch_npu
     glog::glog

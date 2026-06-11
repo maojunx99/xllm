@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
 
@@ -30,10 +31,27 @@ struct type_info {
 };
 
 void create_acltensor(aclTensor** tensor, const torch::Tensor& tensor_data);
-void check_tensor(const torch::Tensor& t,
-                  const std::string& name,
-                  const std::string& func_name = "");
-void check_tensor_shapes_equal(const torch::Tensor& a,
-                               const torch::Tensor& b,
-                               const std::string& func_name = "");
+inline void check_tensor(const torch::Tensor& t,
+                         const std::string& name,
+                         const std::string& func_name = "") {
+  if (!t.defined()) {
+    LOG(FATAL) << func_name << ": " << name << " is not defined";
+  }
+  if (t.numel() == 0) {
+    LOG(FATAL) << func_name << ": " << name << " is empty";
+  }
+  if (t.data_ptr() == nullptr) {
+    LOG(FATAL) << func_name << ": " << name << " data pointer is null";
+  }
+}
+
+inline void check_tensor_shapes_equal(const torch::Tensor& a,
+                                      const torch::Tensor& b,
+                                      const std::string& func_name = "") {
+  if (a.sizes() != b.sizes()) {
+    LOG(ERROR) << func_name << ": tensor shapes do not match. "
+               << "a shape: " << a.sizes() << ", b shape: " << b.sizes();
+    LOG(FATAL) << func_name << ": tensor shapes do not match";
+  }
+}
 }  // namespace xllm::kernel::npu
