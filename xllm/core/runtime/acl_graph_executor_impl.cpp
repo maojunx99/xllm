@@ -19,6 +19,7 @@ limitations under the License.
 #include <c10/core/TensorOptions.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <torch_npu/csrc/core/npu/NPUGuard.h>
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
 
@@ -35,6 +36,8 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/common/metrics.h"
 #include "core/framework/kv_cache/kv_cache_utils.h"
+#include "core/kernels/ops_api.h"
+#include "core/platform/npu/acl_graph_task_update_context.h"
 #include "core/util/utils.h"
 #include "platform/npu/device_capture_lock.h"
 
@@ -77,6 +80,66 @@ int64_t get_decode_graph_capacity(const runtime::Options& options) {
 
 bool is_qwen3_5_model_type(const std::string& model_type) {
   return model_type == "qwen3_5" || model_type.rfind("qwen3_5_", 0) == 0;
+}
+
+std::vector<int64_t> build_query_start_loc_host(
+    const std::vector<int32_t>& q_seq_lens_vec) {
+  std::vector<int64_t> query_start_loc;
+  query_start_loc.reserve(q_seq_lens_vec.size() + 1);
+  int64_t offset = 0;
+  query_start_loc.emplace_back(offset);
+  for (int32_t q_len : q_seq_lens_vec) {
+    offset += q_len;
+    query_start_loc.emplace_back(offset);
+  }
+  return query_start_loc;
+}
+
+std::vector<int64_t> build_linear_state_indices_host(
+    const ModelInputParams& params,
+    int64_t actual_batch_size,
+    int64_t padded_batch_size) {
+  std::vector<int64_t> indices;
+  if (!params.linear_state_indices_host.empty()) {
+    indices = params.linear_state_indices_host;
+  } else {
+    indices.assign(params.linear_state_ids.begin(),
+                   params.linear_state_ids.end());
+  }
+  if (indices.size() > static_cast<size_t>(actual_batch_size)) {
+    indices.resize(actual_batch_size);
+  }
+  indices.resize(padded_batch_size, kCausalConv1dGraphPadSlotId);
+  return indices;
+}
+
+std::vector<int64_t> build_has_initial_state_host(
+    const ModelInputParams& params,
+    int64_t actual_batch_size,
+    int64_t padded_batch_size) {
+  std::vector<int64_t> has_initial_state = params.has_initial_state;
+  if (has_initial_state.size() > static_cast<size_t>(actual_batch_size)) {
+    has_initial_state.resize(actual_batch_size);
+  }
+  has_initial_state.resize(padded_batch_size, 0);
+  return has_initial_state;
+}
+
+std::vector<int64_t> tensor_to_int64_vector(const torch::Tensor& tensor,
+                                            int64_t actual_size,
+                                            int64_t padded_size,
+                                            int64_t pad_value) {
+  std::vector<int64_t> values;
+  if (!tensor.defined()) {
+    return values;
+  }
+  torch::Tensor host_tensor =
+      tensor.to(torch::kCPU).to(torch::kLong).contiguous();
+  const int64_t copy_size = std::min<int64_t>(actual_size, host_tensor.numel());
+  const int64_t* data = host_tensor.data_ptr<int64_t>();
+  values.assign(data, data + copy_size);
+  values.resize(padded_size, pad_value);
+  return values;
 }
 
 }  // namespace
@@ -312,10 +375,10 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   persistent_tokens_.slice(/*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens)
       .copy_(tokens, /*non_blocking=*/true);
   if (padded_num_tokens > actual_num_tokens) {
-    persistent_tokens_
+    persistent_new_cache_slots_
         .slice(
             /*dim=*/0, /*start=*/actual_num_tokens, /*end=*/padded_num_tokens)
-        .zero_();
+        .fill_(kPaddingLinearStateId);
   }
   // mRoPE positions have shape [3, num_tokens], slice on dim 1
   if (use_mrope_) {
@@ -584,6 +647,13 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       params_for_capture->linear_state_indices =
           persistent_linear_state_indices(padded_batch_size);
     }
+    params_for_capture->query_start_loc =
+        build_query_start_loc_host(padded_q_seq_lens_vec);
+    params_for_capture->has_initial_state = build_has_initial_state_host(
+        params, actual_batch_size, padded_batch_size);
+    params_for_capture->linear_state_indices_host =
+        build_linear_state_indices_host(
+            params, actual_batch_size, padded_batch_size);
     // Only set attn_mask if need_update_attn_mask_ is true
     if (need_update_attn_mask_) {
       params_for_capture->graph_buffer.attn_mask =
@@ -598,6 +668,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     if (params.num_accepted_tokens.defined()) {
       params_for_capture->num_accepted_tokens =
           persistent_num_accepted_tokens(padded_batch_size);
+      params_for_capture->num_accepted_tokens_host = tensor_to_int64_vector(
+          params.num_accepted_tokens, actual_batch_size, padded_batch_size, 1);
     }
     if (use_expanded_spec_decode_attention) {
       params_for_capture->graph_buffer
@@ -1117,6 +1189,13 @@ bool AclGraph::capture(CausalLM* model,
       << "update() should return ModelInputParams when "
          "return_capture_params=true";
 
+  if (is_qwen3_5_model_type(args.model_type())) {
+    graph_task_context_ = std::make_shared<AclGraphTaskUpdateContext>();
+    graph_task_context_->begin_capture();
+    graph_params->graph_buffer.acl_graph_task_update_context =
+        graph_task_context_;
+  }
+
   // Synchronize stream to ensure all data is copied to graph persistent buffers
   aclrtSynchronizeStream(stream);
 
@@ -1162,6 +1241,14 @@ bool AclGraph::capture(CausalLM* model,
       persistent_param_.set_aux_hidden_states(forward_result.aux_hidden_states);
     }
     graph_.capture_end();
+    // Dump graph for debugging
+    // std::string dump_path = "/tmp/xllm_graph_dump_" +
+    // std::to_string(bucket_num_tokens) + ".json";
+    // graph_.debug_dump(dump_path);
+    // LOG(INFO) << "Graph dumped to: " << dump_path;
+    if (graph_task_context_ != nullptr) {
+      graph_task_context_->end_capture();
+    }
     // Lock is automatically released here when lock goes out of scope
     if (need_restore_stream) {
       c10_npu::setCurrentNPUStream(
@@ -1170,11 +1257,63 @@ bool AclGraph::capture(CausalLM* model,
   }
   // Synchronize and test replay to verify graph capture
   aclrtSynchronizeStream(stream);
-
   graph_.replay();
-
-  // aclrtSynchronizeStream(stream);
+  update_graph_tasks(graph_params.value());
   return true;
+}
+
+void AclGraph::update_graph_tasks(const ModelInputParams& params) {
+  if (graph_task_context_ == nullptr ||
+      graph_task_context_->causal_conv1d_tasks.empty()) {
+    return;
+  }
+
+  const std::vector<int64_t> empty_host_args;
+  CHECK(!params.query_start_loc.empty())
+      << "causal_conv1d graph update requires padded query_start_loc";
+  CHECK(!params.linear_state_indices_host.empty())
+      << "causal_conv1d graph update requires padded cache indices";
+
+  c10_npu::NPUStream update_stream = update_stream_.value();
+  c10_npu::NPUStreamGuard stream_guard(update_stream);
+
+  for (auto& task : graph_task_context_->causal_conv1d_tasks) {
+    CHECK_EQ(params.query_start_loc.back(), task.x.size(0))
+        << "causal_conv1d graph update host args must be padded to the "
+           "capture x.shape[0]";
+    CHECK_EQ(params.linear_state_indices_host.size() + 1,
+             params.query_start_loc.size())
+        << "cache_indices must be sequence-scoped";
+
+    const std::vector<int64_t>& num_accepted_tokens =
+        task.branch == CausalConv1dGraphBranch::kSpecVerify
+            ? params.num_accepted_tokens_host
+            : empty_host_args;
+    if (task.branch == CausalConv1dGraphBranch::kSpecVerify) {
+      CHECK_EQ(num_accepted_tokens.size(),
+               params.linear_state_indices_host.size())
+          << "spec causal_conv1d graph update requires accepted-token counts";
+    }
+
+    c10_npu::graph_task_update_begin(update_stream, task.handle);
+    xllm::kernel::causal_conv1d_out(
+        task.output,
+        task.x,
+        task.weight,
+        task.conv_state,
+        task.bias,
+        torch::IntArrayRef(params.query_start_loc),
+        torch::IntArrayRef(params.linear_state_indices_host),
+        torch::IntArrayRef(empty_host_args),
+        torch::IntArrayRef(num_accepted_tokens),
+        task.activation_mode,
+        task.pad_slot_id,
+        task.run_mode);
+    c10_npu::graph_task_update_end(update_stream);
+    if (task.event != nullptr) {
+      task.event->record(update_stream);
+    }
+  }
 }
 
 void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
@@ -1183,9 +1322,12 @@ void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
   // must be performed on a non-default stream (see
   // torch_npu/csrc/core/npu/NPUGraph.cpp:159).
   capture_stream_ = c10_npu::getStreamFromPool(true, device_index);
+  update_stream_ = c10_npu::getStreamFromPool(true, device_index);
   device_index_ = device_index;
   LOG(INFO) << "Initialized capture_stream: " << capture_stream_.value()
             << ", id: " << capture_stream_.value().id()
+            << ", update_stream: " << update_stream_.value()
+            << ", id: " << update_stream_.value().id()
             << ", device_index: " << device_index;
 }
 
@@ -1204,25 +1346,23 @@ ModelOutput AclGraph::replay(const torch::Tensor& tokens,
   // be updated when Full Attention layers are involved, which is determined
   // by k_cache being valid and non-empty
   auto [k_cache, v_cache] = find_attention_plan_kv_cache(kv_cache);
-  persistent_param_.update(tokens,
-                           k_cache,
-                           v_cache,
-                           positions,
-                           params,
-                           num_tokens_,
-                           /*return_capture_params=*/false);
+  auto graph_params = persistent_param_.update(tokens,
+                                               k_cache,
+                                               v_cache,
+                                               positions,
+                                               params,
+                                               num_tokens_,
+                                               /*return_capture_params=*/true);
 
-  // Replay captured graph - NPUGraph mempool reuses temporary tensors
-  // Get current NPU stream from libtorch NPU API
-  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
+  CHECK(graph_params.has_value())
+      << "update() should return ModelInputParams for graph task update";
+  std::cout << "[replay] before sync default stream" << std::endl;
+  aclrtSynchronizeStream(c10_npu::getCurrentNPUStream(device_index_).stream());
+  std::cout << "[replay] before graph_.replay()" << std::endl;
   graph_.replay();
-
-  // this is necessary to ensure the graph replay is completed
-  // aclError st = aclrtSynchronizeStream(stream);
-  // CHECK_EQ(st, ACL_SUCCESS)
-  // << "aclrtSynchronizeStream failed, error code: " << st;
-
+  std::cout << "[replay] before update_graph_tasks" << std::endl;
+  update_graph_tasks(graph_params.value());
+  std::cout << "[replay] done" << std::endl;
   // Return the actual num_tokens portion of ModelOutput
   // Note: aux_hidden_states handling is done in AclGraphExecutorImpl::run()
   // since replay() doesn't have access to options

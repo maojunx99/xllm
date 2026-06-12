@@ -53,6 +53,8 @@ struct TilingBufferInfo;
 
 namespace xllm::npu {
 
+struct AclGraphTaskUpdateContext;
+
 // Helper class to hold persistent parameters for graph execution
 // Multiple AclGraph instances can share the same GraphPersistentParam object
 class GraphPersistentParam {
@@ -299,6 +301,8 @@ class AclGraph {
   // Initialize capture stream if not already initialized
   void initialize_capture_stream(c10::DeviceIndex device_index);
 
+  void update_graph_tasks(const ModelInputParams& params);
+
   // NPUGraph with mempool for managing temporary tensors during forward pass
   c10_npu::NPUGraph graph_;
   uint32_t num_tokens_;
@@ -310,6 +314,9 @@ class AclGraph {
   // Cached capture stream, initialized on first capture
   std::optional<c10_npu::NPUStream> capture_stream_;
   c10::DeviceIndex device_index_;
+  std::shared_ptr<AclGraphTaskUpdateContext> graph_task_context_;
+
+  std::optional<c10_npu::NPUStream> update_stream_;
 };
 
 // Executor implementation using ACL graph optimization

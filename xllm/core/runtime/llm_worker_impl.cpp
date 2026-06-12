@@ -97,7 +97,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
 std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const ForwardInput& input) {
   MULTI_MODEL_STEP_LOCK(FLAGS_enable_xtensor);
-
+  std::cout << "888" << std::endl;
   Timer timer;
   auto& sampling_params = input.sampling_params;
 
@@ -129,7 +129,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (FLAGS_enable_eplb) {
     eplb_executor_->eplb_execute(input.eplb_info);
   }
-
+  std::cout << "999" << std::endl;
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
@@ -216,10 +216,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
           /*dim=*/0, sampling_params.selected_token_idxes);
     }
   }
-
+  std::cout << "!!!" << std::endl;
   MULTI_MODEL_STEP_UNLOCK();
   auto ret = device_.synchronize_default_stream();
-
+  std::cout << "???" << std::endl;
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
     auto results =

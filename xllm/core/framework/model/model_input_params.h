@@ -41,6 +41,9 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
+namespace npu {
+struct AclGraphTaskUpdateContext;
+}  // namespace npu
 namespace layer {
 struct AttentionMetadata;
 }  // namespace layer
@@ -418,6 +421,7 @@ struct ModelInputParams {
     params.query_start_loc = query_start_loc;
     params.has_initial_state = has_initial_state;
     params.linear_state_indices_host = linear_state_indices_host;
+    params.num_accepted_tokens_host = num_accepted_tokens_host;
 #endif
     params.expert_load_data = expert_load_data;
     params.expert_array = expert_array;
@@ -438,6 +442,10 @@ struct ModelInputParams {
         safe_to(graph_buffer.attn_mask, device, true);
     params.graph_buffer.tiling_data =
         safe_to(graph_buffer.tiling_data, device, true);
+#if defined(USE_NPU)
+    params.graph_buffer.acl_graph_task_update_context =
+        graph_buffer.acl_graph_task_update_context;
+#endif
 
     // params for flashinfer
     params.paged_kv_indptr = safe_to(paged_kv_indptr, device);
@@ -639,6 +647,8 @@ struct ModelInputParams {
   std::vector<int64_t> has_initial_state;
   // Stable int64 host linear state ids for kernels that take IntArrayRef.
   std::vector<int64_t> linear_state_indices_host;
+  // Stable int64 host accepted-token counts for ACL graph task update.
+  std::vector<int64_t> num_accepted_tokens_host;
 #endif
 
   DpEpPaddingData dp_ep_padding_data;
@@ -692,6 +702,10 @@ struct ModelInputParams {
   struct GraphBuffer {
     torch::Tensor attn_mask;
     torch::Tensor tiling_data;
+#if defined(USE_NPU)
+    std::shared_ptr<npu::AclGraphTaskUpdateContext>
+        acl_graph_task_update_context;
+#endif
     bool use_expanded_decode_for_spec_verify_attention = false;
     torch::Tensor expanded_kv_seq_lens;
     torch::Tensor expanded_block_tables;
