@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
 
 #include <algorithm>
 #include <cctype>
@@ -30,6 +32,46 @@ namespace xllm {
 namespace layer {
 
 namespace {
+
+#if defined(USE_NPU)
+constexpr int64_t kAclFormatFractalNz = 29;
+
+torch::Tensor npu_format_cast(const torch::Tensor& tensor, int64_t format) {
+  return at_npu::native::npu_format_cast(tensor, format);
+}
+
+bool is_nz_format(const torch::Tensor& tensor) {
+  if (tensor.device().is_cpu()) {
+    return false;
+  }
+  return at_npu::native::get_npu_format(tensor) == kAclFormatFractalNz;
+}
+
+void maybe_convert_w8a8_dynamic_weight_to_nz(torch::Tensor& weight) {
+  if (weight.device().is_cpu() || is_nz_format(weight)) {
+    return;
+  }
+  if (weight.is_meta() ||
+      (weight.dtype() != torch::kInt8 && weight.dtype() != torch::kUInt8)) {
+    return;
+  }
+  const char* env = std::getenv("XLLM_W8A8_NZ_DISABLE");
+  if (env != nullptr && env[0] == '1') {
+    return;
+  }
+  weight = npu_format_cast(weight, kAclFormatFractalNz);
+}
+#else
+inline void maybe_convert_w8a8_dynamic_weight_to_nz(torch::Tensor& /*weight*/) {
+}
+#endif
+
+inline void post_process_w8a8_dynamic_weights(torch::Tensor& weight,
+                                              torch::Tensor& weight_scale) {
+  weight_scale = weight_scale.flatten();
+  weight = weight.transpose(0, 1).contiguous();
+  maybe_convert_w8a8_dynamic_weight_to_nz(weight);
+}
 
 // ============================================================================
 // FP8 Fused Weight Utilities
@@ -766,6 +808,7 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight, 0);
     LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_SHARDED_WEIGHT(weight_offset, 0);
     }
@@ -903,6 +946,7 @@ void ColumnParallelLinearImpl::load_state_dict(
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_FUSED_WEIGHT(weight, 0);
     LOAD_FUSED_WEIGHT(weight_scale, 0);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_FUSED_WEIGHT(weight_offset, 0);
     }
@@ -971,6 +1015,7 @@ void ColumnParallelLinearImpl::load_state_dict(
     } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
       LOAD_MERGED_WEIGHT_V2(weight, 0);
       LOAD_MERGED_WEIGHT_V2(weight_scale, 0);
+      post_process_w8a8_dynamic_weights(weight_, weight_scale_);
       if (weight_offset_.defined()) {
         LOAD_MERGED_WEIGHT_V2(weight_offset, 0);
       }
@@ -1227,6 +1272,7 @@ void QKVParallelLinearImpl::load_state_dict(
     LOAD_QKV_WEIGHT(quant_bias, 0, num_kv_head_replicas_);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_QKV_WEIGHT(weight_scale, 0, num_kv_head_replicas_);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_QKV_WEIGHT(weight_offset, 0, num_kv_head_replicas_);
     }
@@ -1285,6 +1331,7 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_SHARDED_WEIGHT(quant_bias, 0);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight_scale, 0);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_SHARDED_WEIGHT(weight_offset, 0);
     }
@@ -1756,6 +1803,7 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_SHARDED_WEIGHT(weight, 1);
     LOAD_WEIGHT(weight_scale);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_WEIGHT(weight_offset);
     }
@@ -1964,6 +2012,7 @@ void ReplicatedLinearImpl::load_state_dict(const StateDict& state_dict) {
     LOAD_WEIGHT(quant_bias);
   } else if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     LOAD_WEIGHT(weight_scale);
+    post_process_w8a8_dynamic_weights(weight_, weight_scale_);
     if (weight_offset_.defined()) {
       LOAD_WEIGHT(weight_offset);
     }
