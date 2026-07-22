@@ -158,6 +158,19 @@ TEST(CpInputPartitionTest, CpPartitionedFlagPropagatesThroughCopy) {
   EXPECT_TRUE(moved.cp_partitioned);
 }
 
+TEST(CpInputPartitionTest,
+     DeviceKvSeqLensSelectionPropagatesThroughDevicePreparation) {
+  ForwardInput input;
+  input.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  input.input_params.meta.num_sequences = 1;
+  input.token_ids = torch::tensor(std::vector<int32_t>{1}, int32_cpu());
+  input.input_params.attention.use_device_kv_seq_lens = true;
+
+  ForwardInput moved = input.to(torch::kCPU, torch::kFloat32);
+
+  EXPECT_TRUE(moved.input_params.attention.use_device_kv_seq_lens);
+}
+
 TEST(CpInputPartitionTest, MixedBatchPartitionsLikePrefill) {
   std::vector<int32_t> tokens(8);
   std::iota(tokens.begin(), tokens.end(), 100);

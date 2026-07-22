@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/runtime/mtp_async_state.h"
 #include "spec_input_builder.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
@@ -202,91 +203,6 @@ bool synchronize_stream_event(const StreamEventPtr& event) {
 #endif
 }
 
-// Dynamic state handed from target verification to the next draft iteration.
-// Every tensor is produced/consumed on the MTP compute stream, so constructing
-// it only queues work and never waits for the previous iteration on CPU.
-struct DeviceDecodeState {
-  torch::Tensor accepted_lengths;
-  torch::Tensor all_draft_accepted;
-  torch::Tensor last_tokens;
-  torch::Tensor previous_tokens;
-  torch::Tensor last_embeddings;
-  torch::Tensor previous_embeddings;
-  torch::Tensor base_positions;
-  torch::Tensor base_kv_seq_lens;
-};
-
-torch::Tensor gather_sequence_rows(const torch::Tensor& values,
-                                   const torch::Tensor& indices) {
-  CHECK_GE(values.dim(), 2);
-  CHECK_EQ(values.size(0), indices.numel());
-  // NPU Gather requires an integral index tensor.  Keep the conversion here
-  // as a hard boundary because arithmetic used to construct an index can
-  // otherwise silently promote it (for example, Tensor / scalar).
-  torch::Tensor gather_index =
-      indices
-          .to(torch::dtype(torch::kLong).device(indices.device()))
-          .view({-1, 1});
-  for (int64_t dim = 2; dim < values.dim(); ++dim) {
-    gather_index = gather_index.unsqueeze(-1);
-  }
-  std::vector<int64_t> expanded_shape = values.sizes().vec();
-  expanded_shape[1] = 1;
-  gather_index = gather_index.expand(expanded_shape);
-  return values.gather(/*dim=*/1, gather_index).squeeze(/*dim=*/1);
-}
-
-DeviceDecodeState build_device_decode_state(
-    const torch::Tensor& accepted_tokens,
-    const torch::Tensor& accepted_embeddings,
-    const torch::Tensor& embedding_placeholder,
-    const torch::Tensor& base_positions,
-    const torch::Tensor& base_kv_seq_lens) {
-  CHECK_EQ(accepted_tokens.dim(), 2);
-  CHECK_EQ(accepted_embeddings.dim(), 3);
-  const int64_t batch_size = accepted_tokens.size(0);
-  CHECK_EQ(accepted_embeddings.size(0), batch_size);
-  CHECK_GE(base_positions.numel(), batch_size);
-  CHECK_GE(base_kv_seq_lens.numel(), batch_size);
-
-  DeviceDecodeState state;
-  state.accepted_lengths =
-      accepted_tokens.ge(0).sum(/*dim=*/1).to(torch::kLong);
-  state.all_draft_accepted =
-      state.accepted_lengths.eq(accepted_tokens.size(/*dim=*/1));
-  torch::Tensor last_indices = (state.accepted_lengths - 1).clamp_min(0);
-  torch::Tensor previous_indices = (state.accepted_lengths - 2).clamp_min(0);
-  state.last_tokens = gather_sequence_rows(accepted_tokens, last_indices);
-  torch::Tensor gathered_previous_tokens =
-      gather_sequence_rows(accepted_tokens, previous_indices);
-  torch::Tensor has_previous = state.accepted_lengths.gt(1);
-  state.previous_tokens = torch::where(
-      has_previous, gathered_previous_tokens, state.last_tokens);
-  state.last_embeddings =
-      gather_sequence_rows(accepted_embeddings, last_indices);
-  torch::Tensor gathered_previous_embeddings =
-      gather_sequence_rows(accepted_embeddings, previous_indices);
-  torch::Tensor placeholder = embedding_placeholder;
-  if (placeholder.dim() == 1) {
-    placeholder = placeholder.unsqueeze(0);
-  }
-  placeholder = placeholder.expand_as(gathered_previous_embeddings);
-  state.previous_embeddings = torch::where(
-      has_previous.view({batch_size, 1}),
-      gathered_previous_embeddings,
-      placeholder);
-
-  state.base_positions =
-      base_positions.flatten().slice(0, 0, batch_size).to(torch::kLong) +
-      state.accepted_lengths;
-  state.base_kv_seq_lens =
-      base_kv_seq_lens.flatten()
-          .slice(0, 0, batch_size)
-          .to(torch::kLong) +
-      state.accepted_lengths;
-  return state;
-}
-
 torch::Tensor build_device_cache_slots(const ForwardInput& input,
                                        const torch::Tensor& positions,
                                        int32_t block_size) {
@@ -296,50 +212,24 @@ torch::Tensor build_device_cache_slots(const ForwardInput& input,
                positions, positions.options().dtype(torch::kInt))
         .flatten();
   }
-  const torch::Tensor& block_tables =
-      input.input_params.attention.device.block_tables;
-  CHECK(block_tables.defined());
-  const int64_t batch_size = positions.size(0);
-  torch::Tensor position_long =
-      positions.to(torch::dtype(torch::kLong).device(positions.device()));
-  // Tensor / scalar performs true division and produces a floating-point
-  // tensor, which is invalid as the index of NPU Gather.  Cache block lookup
-  // needs integer floor division.
-  torch::Tensor block_indices =
-      torch::floor_divide(position_long, block_size)
-          .to(torch::dtype(torch::kLong).device(position_long.device()));
-  torch::Tensor block_ids =
-      block_tables.slice(/*dim=*/0, 0, batch_size)
-          .to(torch::kLong)
-          .gather(/*dim=*/1, block_indices);
-  return (block_ids * block_size + position_long.remainder(block_size))
-      .to(torch::kInt)
-      .flatten();
-}
-
-torch::Tensor make_row_positions(const DeviceDecodeState& state,
-                                 const torch::Tensor& offsets) {
-  return state.base_positions.unsqueeze(1) +
-         offsets.to(state.base_positions.options()).unsqueeze(0);
+  return mtp_async::map_positions_to_cache_slots(
+      input.input_params.attention.device.block_tables,
+      positions,
+      block_size);
 }
 
 void apply_device_row_metadata(ForwardInput& input,
                                const ForwardInput& block_table_source,
-                               const DeviceDecodeState& state,
+                               const mtp_async::AcceptedState& state,
                                const torch::Tensor& offsets,
                                int32_t block_size,
                                bool use_chunked_prefill) {
-  torch::Tensor row_positions = make_row_positions(state, offsets);
+  torch::Tensor row_positions = mtp_async::make_row_positions(state, offsets);
   input.positions = row_positions.flatten().to(input.positions.options());
   input.input_params.attention.device.new_cache_slots =
       build_device_cache_slots(block_table_source, row_positions, block_size);
-  torch::Tensor kv_seq_lens = state.base_kv_seq_lens;
-  if (!use_chunked_prefill) {
-    kv_seq_lens =
-        (state.base_kv_seq_lens.unsqueeze(1) +
-         offsets.to(state.base_kv_seq_lens.options()).unsqueeze(0))
-            .flatten();
-  }
+  torch::Tensor kv_seq_lens =
+      mtp_async::make_kv_seq_lens(state, offsets, use_chunked_prefill);
   input.input_params.attention.device.kv_seq_lens = kv_seq_lens.to(
       input.input_params.attention.device.kv_seq_lens.options());
 }
@@ -395,7 +285,7 @@ void prepare_next_draft_from_accepted_state(
   }
 #endif
 
-  DeviceDecodeState state = build_device_decode_state(
+  mtp_async::AcceptedState state = mtp_async::build_accepted_state(
       accepted_tokens,
       accepted_embeddings,
       embedding_placeholder,
@@ -420,10 +310,8 @@ void prepare_next_draft_from_accepted_state(
   // rejection, keep the row for graph-shape stability but redirect its KV
   // write one position ahead of the visible prefix so it cannot overwrite the
   // valid draft cache consumed by the current-token row.
-  torch::Tensor previous_cache_positions = torch::where(
-      state.all_draft_accepted,
-      state.base_positions - 1,
-      state.base_positions + 1);
+  torch::Tensor previous_cache_positions =
+      mtp_async::make_repair_cache_positions(state);
   torch::Tensor cache_positions =
       torch::stack({previous_cache_positions, state.base_positions},
                    /*dim=*/1);
@@ -437,115 +325,6 @@ void prepare_next_draft_from_accepted_state(
       torch::stack({state.previous_embeddings, state.last_embeddings},
                    /*dim=*/1)
           .flatten(/*start_dim=*/0, /*end_dim=*/1);
-}
-
-#if defined(USE_NPU)
-void apply_mtp_prepare_output_row(
-    ForwardInput& draft_input,
-    const kernel::npu::MtpPrepareNextDraftOutput& output,
-    int64_t row) {
-  CHECK(row == 0 || row == 1);
-  const int64_t batch_size = output.kv_seq_lens.numel();
-  draft_input.token_ids =
-      output.token_ids.view({batch_size, 2})
-          .select(/*dim=*/1, /*index=*/row)
-          .contiguous();
-  draft_input.input_params.embedding.input_embedding =
-      output.embeddings.view({batch_size, 2, -1})
-          .select(/*dim=*/1, /*index=*/row)
-          .contiguous();
-  draft_input.positions =
-      output.positions.view({batch_size, 2})
-          .select(/*dim=*/1, /*index=*/row)
-          .contiguous();
-  draft_input.input_params.attention.device.kv_seq_lens =
-      row == 0 ? output.kv_seq_lens - 1 : output.kv_seq_lens;
-  draft_input.input_params.attention.device.new_cache_slots =
-      output.cache_slots.view({batch_size, 2})
-          .select(/*dim=*/1, /*index=*/row)
-          .contiguous();
-}
-#endif
-
-// Queue device-side accepted-state preparation for two B-row forwards. The
-// repair row restores the missing draft KV only when every proposal was
-// accepted; otherwise its write is redirected to a scratch future slot. The
-// current row is the real first-draft input and therefore keeps the same graph
-// shape as the normal rejection path.
-void prepare_split_next_draft_from_accepted_state(
-    ForwardInput& repair_input,
-    ForwardInput& current_input,
-    const ForwardInput& block_table_source,
-    const torch::Tensor& accepted_tokens,
-    const torch::Tensor& accepted_embeddings,
-    const torch::Tensor& embedding_placeholder,
-    const torch::Tensor& base_positions,
-    const torch::Tensor& base_kv_seq_lens,
-    int32_t block_size) {
-#if defined(USE_NPU)
-  if (block_table_source.input_params.multi_block_tables.empty()) {
-    const auto output = kernel::npu::try_mtp_prepare_next_draft(
-        accepted_tokens,
-        accepted_embeddings,
-        embedding_placeholder,
-        base_positions,
-        base_kv_seq_lens,
-        block_table_source.input_params.attention.device.block_tables,
-        block_size);
-    if (output.has_value()) {
-      apply_mtp_prepare_output_row(repair_input, *output, /*row=*/0);
-      apply_mtp_prepare_output_row(current_input, *output, /*row=*/1);
-      return;
-    }
-  }
-#endif
-
-  DeviceDecodeState state = build_device_decode_state(
-      accepted_tokens,
-      accepted_embeddings,
-      embedding_placeholder,
-      base_positions,
-      base_kv_seq_lens);
-  torch::Tensor repair_offsets = torch::arange(
-      /*start=*/-1,
-      /*end=*/0,
-      torch::TensorOptions()
-          .dtype(torch::kLong)
-          .device(accepted_tokens.device()));
-  torch::Tensor current_offsets = torch::arange(
-      /*start=*/0,
-      /*end=*/1,
-      torch::TensorOptions()
-          .dtype(torch::kLong)
-          .device(accepted_tokens.device()));
-  apply_device_row_metadata(repair_input,
-                            block_table_source,
-                            state,
-                            repair_offsets,
-                            block_size,
-                            /*use_chunked_prefill=*/false);
-  apply_device_row_metadata(current_input,
-                            block_table_source,
-                            state,
-                            current_offsets,
-                            block_size,
-                            /*use_chunked_prefill=*/false);
-
-  torch::Tensor repair_cache_positions = torch::where(
-      state.all_draft_accepted,
-      state.base_positions - 1,
-      state.base_positions + 1);
-  repair_input.input_params.attention.device.new_cache_slots =
-      build_device_cache_slots(block_table_source,
-                               repair_cache_positions.unsqueeze(1),
-                               block_size);
-  repair_input.token_ids =
-      state.previous_tokens.to(repair_input.token_ids.options());
-  repair_input.input_params.embedding.input_embedding =
-      state.previous_embeddings;
-  current_input.token_ids =
-      state.last_tokens.to(current_input.token_ids.options());
-  current_input.input_params.embedding.input_embedding = state.last_embeddings;
 }
 
 #if defined(USE_NPU)
@@ -651,17 +430,11 @@ torch::Tensor select_mtp_topk_indices_for_next_step(
       topk_indices.size(0) == selected_idxes.numel()) {
     return topk_indices;
   }
-  CHECK_GE(topk_indices.dim(), 1)
-      << "MTP DSA top-k indices must have at least one dimension.";
   if (selected_idxes.device().is_cpu()) {
     CHECK_GT(topk_indices.size(0), selected_idxes.max().item<int64_t>())
         << "MTP selected top-k index exceeds top-k rows.";
   }
-  torch::Tensor index =
-      selected_idxes
-          .to(torch::dtype(torch::kLong).device(topk_indices.device()))
-          .contiguous();
-  return topk_indices.index_select(/*dim=*/0, index);
+  return mtp_async::select_rows(topk_indices, selected_idxes);
 }
 
 std::optional<ForwardOutput> run_llm_no_sync_impl(
@@ -949,6 +722,14 @@ bool is_qwen3_5_draft_model_type(const std::string& model_type) {
 
 bool is_mimo_target_model_type(const std::string& model_type) {
   return model_type == "mimo";
+}
+
+bool is_glm5_target_model_type(const std::string& model_type) {
+  return model_type == "glm_moe_dsa";
+}
+
+bool is_glm5_draft_model_type(const std::string& model_type) {
+  return model_type == "glm_moe_dsa_mtp";
 }
 
 }  // namespace
@@ -1476,13 +1257,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   const bool use_prelaunched_first_draft =
-      can_prelaunch_split_first_draft() &&
+      can_use_combined_first_draft() &&
       pending_draft_context_matches(input);
   const bool matching_device_target_context =
       pending_target_context_matches(input);
   const bool use_device_target_context =
-      enable_schedule_overlap() && use_chunked_prefill_spec_verify_path() &&
-      matching_device_target_context &&
+      can_use_combined_first_draft() && matching_device_target_context &&
       device_target_context_is_primed(input);
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
@@ -1599,6 +1379,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         current_draft_input,
         *compute_stream_,
         /*force_two_rows=*/true);
+    current_draft_input.input_params.attention.use_device_kv_seq_lens = true;
 
     prepare_next_draft_from_accepted_state(
         current_draft_input,
@@ -1608,7 +1389,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         embedding_cache_->embedding_placeholder(),
         pending_target_context_.base_positions,
         pending_target_context_.base_kv_seq_lens,
-        ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel(),
+        /*use_chunked_prefill=*/false,
         options_.block_size());
   } else {
     // First decode after prefill and batch transitions use the host cache.
@@ -1692,7 +1473,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       if (reuse_mtp_topk_indices) {
         mtp_topk_indices = select_mtp_topk_indices_for_next_step(
             draft_outputs.back().dsa_topk_indices,
-            current_draft_input.sampling_params);
+            draft_prepared[draft_idx].sampling_params);
       }
       // Unify this step's draft next_tokens across the consensus group before
       // process_draft_sample_output() compresses the still-full [batch, vocab]
@@ -1793,18 +1574,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
               timer.elapsed_seconds());
 
   const bool prelaunch_next_first_draft =
-      can_prelaunch_split_first_draft() &&
+      can_use_combined_first_draft() &&
       device_target_context_is_primed(input);
-  ForwardInput next_first_draft_repair_input;
-  ForwardInput next_first_draft_current_input;
+  ForwardInput next_first_draft_input;
   if (prelaunch_next_first_draft) {
     // This input is independent of the accepted token.  Prepare it on the
     // auxiliary stream while target verification is still executing; the
     // compute stream consumes it through a device-side event after rejection
     // sampling, with no host synchronization.
-    prepare_next_first_draft_template(input,
-                                      next_first_draft_repair_input,
-                                      next_first_draft_current_input);
+    prepare_next_first_draft_template(input, next_first_draft_input);
   }
 
   // verify the proposals with target and update the batch
@@ -1887,8 +1665,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
         val_output,
         base_positions,
         base_kv_seq_lens,
-        std::move(next_first_draft_repair_input),
-        std::move(next_first_draft_current_input));
+        std::move(next_first_draft_input));
   }
   target_output.ready_event = handoff_ready_event;
 
@@ -2004,16 +1781,52 @@ void MTPWorkerImpl::flush_pending_target_context() {
   pending_target_context_ = PendingTargetContext();
 }
 
-bool MTPWorkerImpl::can_prelaunch_split_first_draft() const {
-  return enable_schedule_overlap() && use_chunked_prefill_spec_verify_path() &&
-         parallel_args_.dp_size() <= 1 &&
-         !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+bool MTPWorkerImpl::can_use_combined_first_draft() const {
+  const ModelArgs* draft_model_args =
+      draft_impl_ != nullptr &&
+              draft_impl_->get_status() != WorkerImpl::Status::UNINITIALIZED
+          ? &draft_impl_->context_.get_model_args()
+          : nullptr;
+  const bool draft_has_recurrent_layers =
+      draft_model_args == nullptr ||
+      has_linear_attention_layers(*draft_model_args);
+  const bool is_glm5_draft =
+      draft_model_args != nullptr &&
+      is_glm5_draft_model_type(draft_model_args->model_type());
+  const bool supports_device_target_context =
+      use_chunked_prefill_spec_verify_path() ||
+      (impl_ != nullptr &&
+       impl_->get_status() != WorkerImpl::Status::UNINITIALIZED &&
+       is_glm5_target_model_type(impl_->context_.get_model_args().model_type()));
+#if defined(USE_NPU)
+  // Only explicitly declared draft architectures may use the standard
+  // combined decode layout. Layer count does not identify the attention/cache
+  // implementation: GLM5 is also one-layer, but uses MLA + DSA instead.
+  const bool use_standard_paged_attention =
+      device_.unwrap().is_privateuseone() && draft_model_args != nullptr &&
+      ::xllm::KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&
+      is_qwen3_5_draft_model_type(draft_model_args->model_type());
+  const bool supports_combined_draft_attention =
+      use_standard_paged_attention || is_glm5_draft;
+  const bool draft_is_eager =
+      is_glm5_draft || use_standard_paged_attention;
+#else
+  const bool supports_combined_draft_attention = false;
+  const bool draft_is_eager = false;
+#endif
+  return mtp_async::can_use_combined_decode(
+      enable_schedule_overlap(),
+      supports_device_target_context,
+      supports_combined_draft_attention,
+      draft_has_recurrent_layers,
+      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel(),
+      draft_is_eager,
+      parallel_args_.dp_size());
 }
 
 void MTPWorkerImpl::prepare_next_first_draft_template(
     const ForwardInput& input,
-    ForwardInput& repair_input,
-    ForwardInput& current_input) {
+    ForwardInput& combined_input) {
   CHECK(embedding_cache_ != nullptr);
 
   ForwardInput metadata_template = input;
@@ -2050,18 +1863,12 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
   prepare_draft_extend_inputs(
       metadata_template,
       template_states,
-      current_input,
+      combined_input,
       *prepare_stream_,
-      /*force_two_rows=*/false);
-  current_input.skip_sampling_for_logits_only = false;
-  finish_metadata_prepare(*prepare_stream_, current_input);
-
-  // Both forwards use identical B-row host metadata. Dynamic token, embedding,
-  // position and KV tensors are assigned independently on the compute stream
-  // after rejection sampling. Repair is logits-only so it neither wastes a
-  // sampler launch nor advances the stochastic sampler RNG.
-  repair_input = current_input;
-  repair_input.skip_sampling_for_logits_only = true;
+      /*force_two_rows=*/true);
+  combined_input.skip_sampling_for_logits_only = false;
+  combined_input.input_params.attention.use_device_kv_seq_lens = true;
+  finish_metadata_prepare(*prepare_stream_, combined_input);
 }
 
 void MTPWorkerImpl::enqueue_next_first_draft(
@@ -2069,8 +1876,7 @@ void MTPWorkerImpl::enqueue_next_first_draft(
     const SampleOutput& validate_output,
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
-    ForwardInput repair_input,
-    ForwardInput current_input) {
+    ForwardInput combined_input) {
   CHECK(!pending_draft_context_.output.has_value())
       << "MTP first-draft prelaunch was not consumed";
   CHECK(validate_output.next_tokens.defined());
@@ -2078,46 +1884,36 @@ void MTPWorkerImpl::enqueue_next_first_draft(
   CHECK(embedding_cache_ != nullptr);
 
   c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  wait_metadata_ready_event(current_input, *compute_stream_);
-  clear_ready_events(repair_input);
-  clear_ready_events(current_input);
+  wait_metadata_ready_event(combined_input, *compute_stream_);
+  clear_ready_events(combined_input);
 
-  // Prepare both B-row inputs in one fused launch, then enqueue repair and
-  // current forwards back-to-back behind target rejection sampling. Same-
-  // stream FIFO makes the repaired KV visible to current without a host wait.
-  prepare_split_next_draft_from_accepted_state(
-      repair_input,
-      current_input,
+  // Interleave [repair, current] rows in one decode batch. Every transformer
+  // layer projects both rows, writes both KV rows, and only then launches
+  // PagedAttention. Same-stream ordering therefore makes repair KV visible to
+  // the current row without a host wait or a separate repair forward.
+  prepare_next_draft_from_accepted_state(
+      combined_input,
       input,
       validate_output.next_tokens,
       validate_output.embeddings,
       embedding_cache_->embedding_placeholder(),
       base_positions,
       base_kv_seq_lens,
+      /*use_chunked_prefill=*/false,
       options_.block_size());
 
   pending_draft_context_.embedding_ids =
       input.input_params.embedding.embedding_ids;
   pending_draft_context_.request_ids =
       input.input_params.embedding.request_ids;
-  ForwardInput repair_prepared_input;
-  std::optional<ForwardOutput> repair_output = run_llm_no_sync_impl(
-      *draft_impl_,
-      repair_input,
-      *compute_stream_,
-      *compute_stream_,
-      repair_prepared_input);
-  CHECK(repair_output.has_value())
-      << "failed to prelaunch MTP draft KV repair";
   pending_draft_context_.output = run_llm_no_sync_impl(
       *draft_impl_,
-      current_input,
+      combined_input,
       *compute_stream_,
       *compute_stream_,
       pending_draft_context_.prepared_input);
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
-  transfer_retained_inputs(*pending_draft_context_.output, *repair_output);
 }
 
 bool MTPWorkerImpl::pending_draft_context_matches(

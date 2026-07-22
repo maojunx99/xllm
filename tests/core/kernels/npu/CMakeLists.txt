@@ -16,4 +16,24 @@ include(cc_test)
 #     glog::glog
 # )
 
+cc_test(
+  NAME
+    mtp_prepare_next_draft_test
+  SRCS
+    mtp_prepare_next_draft_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/runtime/mtp_async_state.cpp"
+  DEPS
+    :xllm_ops
+    ascendcl
+    nnopbase
+    torch
+    torch_npu
+    GTest::gtest_main
+    glog::glog
+)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(mtp_prepare_next_draft_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()
+
 add_subdirectory(tilelang)

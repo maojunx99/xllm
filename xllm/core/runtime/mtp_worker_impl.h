@@ -163,16 +163,14 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool pending_target_context_matches(const ForwardInput& input) const;
   bool device_target_context_is_primed(const ForwardInput& input) const;
   void flush_pending_target_context();
-  bool can_prelaunch_split_first_draft() const;
+  bool can_use_combined_first_draft() const;
   void prepare_next_first_draft_template(const ForwardInput& input,
-                                         ForwardInput& repair_input,
-                                         ForwardInput& current_input);
+                                         ForwardInput& combined_input);
   void enqueue_next_first_draft(const ForwardInput& input,
                                 const SampleOutput& validate_output,
                                 const torch::Tensor& base_positions,
                                 const torch::Tensor& base_kv_seq_lens,
-                                ForwardInput repair_input,
-                                ForwardInput current_input);
+                                ForwardInput combined_input);
   bool pending_draft_context_matches(const ForwardInput& input) const;
 
  protected:
