@@ -196,7 +196,7 @@ class TestModelExecutorConstruction:
         executor = ModelExecutor(model, config, max_seqs_per_batch=4)
 
         assert executor._num_attention_layers == 3
-        assert executor.decode_cuda_graph_runner is None
+        assert executor.decode_graph_runner is None
         assert executor.inductor_runner is None
 
     @patch(
@@ -227,7 +227,7 @@ class TestModelExecutorConstruction:
             executor = ModelExecutor(
                 model, {"python_graph_backend": off_value}, max_seqs_per_batch=4
             )
-            assert executor.decode_cuda_graph_runner is None
+            assert executor.decode_graph_runner is None
             assert executor.inductor_runner is None
 
 
