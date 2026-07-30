@@ -85,6 +85,7 @@ DEFINE_string(
     python_graph_backend,
     "off",
     "Graph backend for the Python model executor. "
+    "Defaults to aclgraph on NPU when --enable_graph is enabled. "
     "Values: off (eager), cudagraphs (CUDA decode graph with eager prefill), "
     "aclgraph (NPU decode graph with eager prefill), "
     "or any torch.compile backend name.");

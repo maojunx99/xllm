@@ -42,6 +42,7 @@ from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
     _create_attention_backend,
     _is_npu_device,
+    _resolve_graph_backend,
 )
 
 
@@ -141,6 +142,21 @@ class TestIsNpuDevice:
 
     def test_cpu_type(self):
         assert _is_npu_device(torch.device("cpu")) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: graph backend resolution
+# ---------------------------------------------------------------------------
+
+
+class TestNpuGraphBackendResolution:
+    def test_enable_graph_selects_aclgraph_on_npu(self):
+        config = {"enable_graph": True, "python_graph_backend": "off"}
+
+        assert (
+            _resolve_graph_backend(config, torch.device("npu"))
+            == "aclgraph"
+        )
 
 
 # ---------------------------------------------------------------------------

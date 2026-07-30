@@ -38,6 +38,8 @@ import torch.nn as nn
 from xllm.python import ops
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
 from xllm.python.model_executor.forward_context import (
+    AclGraphCaptureContext,
+    AclGraphTask,
     ForwardContext,
     forward_context,
 )
@@ -77,7 +79,7 @@ class _DecodeGraphEntry:
         "kv_seq_lens_delta",
         "host_seq_lens",
         "host_block_counts",
-        "task_handles",
+        "graph_tasks",
     )
 
 
@@ -99,6 +101,8 @@ class DecodeAclGraphRunner(BaseRunner):
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
         self._stream: torch.npu.Stream | None = None
+        self._update_stream: torch.npu.Stream | None = None
+        self._replay_done_event: torch.npu.Event | None = None
         self._warmed_up = False
 
     def can_execute(
@@ -169,34 +173,36 @@ class DecodeAclGraphRunner(BaseRunner):
 
         if self._stream is None:
             self._stream = torch.npu.Stream(device=input_ids.device)
+            self._update_stream = torch.npu.Stream(
+                device=input_ids.device, priority=-1
+            )
+            self._replay_done_event = torch.npu.Event()
+
+        assert self._update_stream is not None
+        assert self._replay_done_event is not None
 
         self._fill_entry(entry, input_ids, positions, metadata, batch_size)
 
-        self.attention_backend.prepare(
-            metadata,
-            graph_mode=True,
-            static_block_table=entry.static_metadata.block_table,
-            padded_batch_size=padded_batch_size,
-            static_slot_mapping=entry.static_metadata.slot_mapping,
-        )
+        self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
 
         if first_capture:
-            with forward_context(
-                ForwardContext(self.attention_backend, self.device)
-            ):
-                self._capture(entry)
+            self._capture(entry)
 
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
-            with forward_context(
-                ForwardContext(self.attention_backend, self.device)
-            ):
-                if not first_capture:
-                    self.attention_backend.update_replay_args(
-                        self._stream, entry.task_handles
-                    )
-                entry.graph.replay()
-                output = entry.static_output[:batch_size].clone()
+            entry.graph.replay()
+            output = entry.static_output[:batch_size].clone()
+
+        # A captured FIA task waits on its update event before execution.  This
+        # lets replay run concurrently with the host-side updates for later
+        # layers while preventing the graph from observing stale parameters.
+        with torch.npu.stream(self._update_stream):
+            self._update_stream.wait_event(self._replay_done_event)
+            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+
+        # The next update must not overwrite task parameters until this replay
+        # has consumed them.
+        self._replay_done_event.record(self._stream)
 
         torch.npu.current_stream().wait_stream(self._stream)
         return output
@@ -232,7 +238,7 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.batch_size = padded_batch_size
         entry.graph = None
         entry.static_output = None
-        entry.task_handles = []
+        entry.graph_tasks = []
         entry.static_input_ids = torch.zeros(
             padded_batch_size, dtype=input_ids.dtype, device=device
         )
@@ -358,6 +364,19 @@ class DecodeAclGraphRunner(BaseRunner):
 
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
+        torch.sub(
+            cumulative_seq_lens[1:],
+            cumulative_seq_lens[:-1],
+            out=entry.host_seq_lens[:batch_size],
+        )
+        if padded_batch_size > batch_size:
+            entry.host_seq_lens[batch_size:padded_batch_size].fill_(1)
+        torch.cumsum(
+            entry.host_seq_lens,
+            dim=0,
+            out=static_metadata.kv_seq_lens_host[1:],
+        )
+
         page_size = self.attention_backend.page_size
         if page_size == 1:
             static_metadata.paged_kv_indptr_host[: batch_size + 1].copy_(
@@ -365,13 +384,6 @@ class DecodeAclGraphRunner(BaseRunner):
             )
             static_metadata.paged_kv_last_page_len_host.fill_(1)
         else:
-            torch.sub(
-                cumulative_seq_lens[1:],
-                cumulative_seq_lens[:-1],
-                out=entry.host_seq_lens[:batch_size],
-            )
-            if padded_batch_size > batch_size:
-                entry.host_seq_lens[batch_size:padded_batch_size].zero_()
             torch.add(
                 entry.host_seq_lens,
                 page_size - 1,
@@ -413,22 +425,37 @@ class DecodeAclGraphRunner(BaseRunner):
                 batch_size + 1 : padded_batch_size + 1
             ].fill_(int(cumulative_seq_lens[-1]))
 
-        static_metadata.kv_seq_lens_host[: batch_size + 1].copy_(
-            cumulative_seq_lens
-        )
-        if padded_batch_size > batch_size:
-            static_metadata.kv_seq_lens_host[
-                batch_size + 1 :
-            ].fill_(int(cumulative_seq_lens[-1]))
-
     def _capture(self, entry: _DecodeGraphEntry) -> None:
-        for _ in range(_CAPTURE_WARMUP_STEPS):
-            self.model(entry.static_input_ids, entry.static_positions)
+        context = ForwardContext(self.attention_backend, self.device)
+        with forward_context(context):
+            for _ in range(_CAPTURE_WARMUP_STEPS):
+                self.model(entry.static_input_ids, entry.static_positions)
         torch.npu.synchronize()
         entry.graph = torch.npu.NPUGraph()
-        self.attention_backend.begin_capture(self._stream)
-        with torch.npu.graph(entry.graph, stream=self._stream):
-            entry.static_output = self.model(
-                entry.static_input_ids, entry.static_positions
-            )
-        entry.task_handles = self.attention_backend.end_capture()
+        capture_context = AclGraphCaptureContext(self._stream, [])
+        context = ForwardContext(
+            self.attention_backend,
+            self.device,
+            acl_graph=capture_context,
+        )
+        with forward_context(context):
+            with torch.npu.graph(entry.graph, stream=self._stream):
+                entry.static_output = self.model(
+                    entry.static_input_ids, entry.static_positions
+                )
+        entry.graph_tasks = capture_context.tasks
+
+    @staticmethod
+    def _update_graph_tasks(
+        stream: torch.npu.Stream,
+        graph_tasks: list[AclGraphTask],
+    ) -> None:
+        for task in graph_tasks:
+            torch.npu.graph_task_update_begin(stream, task.handle)
+            try:
+                task.update()
+            except Exception:
+                torch.npu.graph_task_update_end(stream)
+                raise
+            torch.npu.graph_task_update_end(stream)
+            task.event.record(stream)

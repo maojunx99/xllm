@@ -27,6 +27,10 @@ import torch_npu
 
 from xllm.python import ops
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, KVCache
+from xllm.python.model_executor.forward_context import (
+    AclGraphTask,
+    get_forward_context,
+)
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
@@ -60,10 +64,6 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._graph_lses: dict[int, torch.Tensor] = {}
         self._current_graph_output: torch.Tensor | None = None
         self._current_graph_lse: torch.Tensor | None = None
-        self._in_capture: bool = False
-        self._task_handles: list[object] = []
-        self._static_slot_mapping: torch.Tensor | None = None
-        self._capture_stream: torch.npu.Stream | None = None
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1)
             .to(torch.int8)
@@ -91,12 +91,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
-        static_block_table: torch.Tensor | None = None,
-        padded_batch_size: int | None = None,
-        static_slot_mapping: torch.Tensor | None = None,
     ) -> None:
         self._metadata = metadata
-        self._static_slot_mapping = static_slot_mapping
         if metadata.q_cu_seq_lens is not None:
             self._actual_seq_lens: list[int] | None = (
                 metadata.q_cu_seq_lens[1:].cpu().tolist()
@@ -105,15 +101,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
             self._actual_seq_lens = None
 
         if metadata.block_table is not None:
-            if static_block_table is not None:
-                self._block_table_i32 = static_block_table
-            else:
-                self._block_table_i32 = metadata.block_table.to(torch.int32)
+            self._block_table_i32 = metadata.block_table.to(torch.int32)
 
             real_batch = metadata.block_table.shape[0]
-            padded_batch = (
-                padded_batch_size if padded_batch_size is not None else real_batch
-            )
 
             kv_host = metadata.kv_seq_lens_host
             if kv_host is not None:
@@ -126,9 +116,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 per_seq_kv = torch.ones(real_batch, dtype=torch.int32)
 
             kv_list = per_seq_kv[:real_batch].tolist()
-            kv_list.extend([1] * (padded_batch - real_batch))
 
-            self._actual_seq_q: list[int] = list(range(1, padded_batch + 1))
+            self._actual_seq_q: list[int] = list(range(1, real_batch + 1))
             self._actual_seq_kv: list[int] = kv_list
         else:
             self._block_table_i32 = None
@@ -194,13 +183,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # Write KV to paged cache (kernel expects [T, kv_heads, head_dim]).
         k_3d = k.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
         v_3d = v.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
-        slot_mapping = (
-            self._static_slot_mapping
-            if self._static_slot_mapping is not None
-            else metadata.slot_mapping
-        )
         ops.reshape_paged_cache(
-            slot_mapping, k_3d, v_3d, k_cache, v_cache
+            metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache
         )
 
         q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
@@ -268,8 +252,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         k_flat = k_cache.view(k_cache.size(0), block_size, -1)
         v_flat = v_cache.view(v_cache.size(0), block_size, -1)
 
-        if self._in_capture and self._current_graph_output is not None:
-            stream = self._capture_stream
+        graph_context = get_forward_context().acl_graph
+        if graph_context is not None:
+            if self._current_graph_output is None:
+                raise RuntimeError("ACL graph output buffer is not prepared")
+            stream = graph_context.stream
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
             torch.npu.graph_task_group_begin(stream)
             try:
                 self._fia_out(q_3d, k_flat, v_flat, block_size)
@@ -277,8 +267,12 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 torch.npu.graph_task_group_end(stream)
                 raise
             handle = torch.npu.graph_task_group_end(stream)
-            self._task_handles.append(
-                (handle, q_3d, k_flat, v_flat, block_size)
+
+            def _update_fia_args() -> None:
+                self._fia_out(q_3d, k_flat, v_flat, block_size)
+
+            graph_context.tasks.append(
+                AclGraphTask(event, handle, _update_fia_args)
             )
             return self._current_graph_output.reshape(
                 num_tokens, self.num_heads * self.head_dim
@@ -300,24 +294,6 @@ class NpuPagedAttentionBackend(AttentionBackend):
             softmax_lse_flag=False,
         )
         return output.reshape(num_tokens, self.num_heads * self.head_dim)
-
-    def begin_capture(self, stream: torch.npu.Stream) -> None:
-        self._in_capture = True
-        self._capture_stream = stream
-        self._task_handles.clear()
-
-    def end_capture(self) -> list[object]:
-        self._in_capture = False
-        return list(self._task_handles)
-
-    def update_replay_args(
-        self, stream: torch.npu.Stream, handles: list[object],
-    ) -> None:
-        for item in handles:
-            handle, q, k, v, block_size = item
-            torch.npu.graph_task_update_begin(stream, handle)
-            self._fia_out(q, k, v, block_size)
-            torch.npu.graph_task_update_end(stream)
 
     # ------------------------------------------------------------------
     # Helpers

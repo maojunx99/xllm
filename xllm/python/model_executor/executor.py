@@ -26,6 +26,15 @@ def _is_npu_device(device: torch.device) -> bool:
     return device.type in ("npu", "privateuseone")
 
 
+def _resolve_graph_backend(config: dict, device: torch.device) -> str:
+    graph_backend = str(config.get("python_graph_backend", "off")).lower()
+    graph_disabled = graph_backend in ("", "off", "none", "0")
+    if graph_disabled and config.get("enable_graph", False):
+        if _is_npu_device(device):
+            return "aclgraph"
+    return graph_backend
+
+
 def _create_attention_backend(
     first_attention: Attention,
     device: torch.device,
@@ -97,7 +106,7 @@ class ModelExecutor:
         self.decode_graph_runner = None
         self.inductor_runner = None
 
-        graph_backend = str(config.get("python_graph_backend", "off")).lower()
+        graph_backend = _resolve_graph_backend(config, device)
         if graph_backend in ("", "off", "none", "0"):
             pass
         elif graph_backend == "cudagraphs":

@@ -53,9 +53,6 @@ class AttentionBackend(ABC):
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
-        static_block_table: torch.Tensor | None = None,
-        padded_batch_size: int | None = None,
-        static_slot_mapping: torch.Tensor | None = None,
     ) -> None:
         pass
 
