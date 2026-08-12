@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cmath>
+
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -32,6 +34,57 @@ namespace xllm {
 namespace layer {
 
 using namespace qwen3_vision_encoder_constants;
+
+namespace {
+
+constexpr char kWeightSuffix[] = "weight";
+constexpr char kDeqScaleSuffix[] = "deq_scale";
+constexpr char kInputScaleSuffix[] = "input_scale";
+
+bool supports_w8a8_fallback(int index) {
+  return index == IN_QKV_WEIGHT || index == IN_WATTENTION_OUT_WEIGHT ||
+         index == IN_LINEAR_FC1_WEIGHT;
+}
+
+std::string sibling_tensor_name(const std::string& weight_name,
+                                const char* suffix) {
+  CHECK(absl::EndsWith(weight_name, kWeightSuffix));
+  return weight_name.substr(0,
+                            weight_name.size() - (sizeof(kWeightSuffix) - 1)) +
+         suffix;
+}
+
+torch::Tensor dequantize_w8a8_weight(const StateDict& state_dict,
+                                     const std::string& weight_name,
+                                     torch::ScalarType target_dtype) {
+  const auto deq_scale_name = sibling_tensor_name(weight_name, kDeqScaleSuffix);
+  const auto input_scale_name =
+      sibling_tensor_name(weight_name, kInputScaleSuffix);
+  const auto quant_weight = state_dict.get_tensor(weight_name);
+  const auto deq_scale = state_dict.get_tensor(deq_scale_name);
+  const auto input_scale = state_dict.get_tensor(input_scale_name);
+
+  CHECK(quant_weight.defined()) << "missing quantized weight " << weight_name;
+  CHECK(deq_scale.defined()) << "missing dequant scale " << deq_scale_name;
+  CHECK(input_scale.defined()) << "missing input scale " << input_scale_name;
+  CHECK_EQ(quant_weight.scalar_type(), torch::kInt8)
+      << "unexpected dtype for " << weight_name;
+  CHECK_EQ(quant_weight.dim(), 2) << "unexpected rank for " << weight_name;
+  CHECK_EQ(deq_scale.numel(), quant_weight.size(0))
+      << "dequant scale does not match output channels for " << weight_name;
+  CHECK_EQ(input_scale.numel(), 1)
+      << "input scale must be scalar for " << weight_name;
+
+  const float input_scale_value = input_scale.item<float>();
+  CHECK(std::isfinite(input_scale_value) && input_scale_value != 0.0f)
+      << "input scale must be finite and nonzero for " << weight_name;
+  const auto channel_scale = deq_scale.to(torch::kFloat32) / input_scale_value;
+  return (quant_weight.to(torch::kFloat32) * channel_scale.reshape({-1, 1}))
+      .to(target_dtype)
+      .contiguous();
+}
+
+}  // namespace
 
 Qwen3VisionEncoderLoader::Qwen3VisionEncoderLoader(uint64_t weight_count,
                                                    const ModelContext& context,
@@ -61,11 +114,26 @@ Qwen3VisionEncoderLoader::Qwen3VisionEncoderLoader(uint64_t weight_count,
 void Qwen3VisionEncoderLoader::load_state_dict(const StateDict& state_dict) {
   const bool to_host = load_to_host();
   for (const auto& [index, name] : WEIGHT_MAPPING) {
-    if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
-      set_weight(state_dict, name, index, WEIGHT_SHARD[index], to_host);
-    } else {
-      set_weight(state_dict, name, index, to_host);
+    const bool use_w8a8_fallback =
+        supports_w8a8_fallback(index) &&
+        state_dict.has(sibling_tensor_name(name, kDeqScaleSuffix));
+    if (use_w8a8_fallback) {
+      auto weight = dequantize_w8a8_weight(state_dict, name, dtype_);
+      const auto shard_it = WEIGHT_SHARD.find(index);
+      if (shard_it != WEIGHT_SHARD.end() && encode_param_world_size_ > 1) {
+        weight = weight.chunk(encode_param_world_size_, shard_it->second)
+                     .at(encode_param_rank_);
+      }
+      working_tensors()[index] = weight.to(target_device());
+      continue;
     }
+
+    const auto shard_it = WEIGHT_SHARD.find(index);
+    if (shard_it != WEIGHT_SHARD.end()) {
+      set_weight(state_dict, name, index, shard_it->second, to_host);
+      continue;
+    }
+    set_weight(state_dict, name, index, to_host);
   }
 }
 

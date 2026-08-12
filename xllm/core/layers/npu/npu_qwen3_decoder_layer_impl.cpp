@@ -28,6 +28,9 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/layers/npu/loader/qwen3_decoder_loader.h"
+#include "operations/aclnn/ops/quant_matmul_nz_decode_operation.h"
+#include "operations/aclnn/ops/quant_matmul_nz_swiglu_decode_operation.h"
+#include "operations/aclnn/utils/utils.h"
 #include "operations/fusion/mlp/mlp.h"
 #include "util/rec_model_utils.h"
 
@@ -39,6 +42,23 @@ namespace xllm {
 namespace layer {
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 56;
+namespace {
+
+constexpr int64_t kOptimizedHiddenSize = 5120;
+constexpr int64_t kOptimizedIntermediateSizePerRank = 3200;
+constexpr int64_t kMaxOptimizedDecodeTokens = 16;
+
+bool is_low_latency_decode_bucket(const torch::Tensor& input) {
+  if (!input.defined() || (input.dim() != 2 && input.dim() != 3) ||
+      input.size(-1) != kOptimizedHiddenSize) {
+    return false;
+  }
+  const int64_t hidden_size = input.size(-1);
+  const int64_t token_count = input.numel() / hidden_size;
+  return token_count > 0 && token_count <= kMaxOptimizedDecodeTokens;
+}
+
+}  // namespace
 
 void NpuQwen3DecoderLayerImpl::param_from_args(
     atb_speed::qwen::QwenLayerParam& param,
@@ -109,6 +129,7 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   }
   initialize_parallel_parameters(param, parallel_args);
   initialize_quantization_parameters(param);
+  param.enableQuantMatmulNzSwigluDecode = false;
 
   if (isPrefill) {
     param.enableAclnnRmsNorm =
@@ -151,6 +172,7 @@ void NpuQwen3DecoderLayerImpl::initialize_parallel_parameters(
 
 void NpuQwen3DecoderLayerImpl::initialize_quantization_parameters(
     atb_speed::qwen::QwenLayerParam& param) {
+  param.enableSwigluQuant = false;
   if (quantize_type_.empty()) {
     param.linearDescs = {static_cast<int>(LinearTypeV2::BFLOAT16),
                          static_cast<int>(LinearTypeV2::INVALID),
@@ -196,6 +218,22 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
 
   param_from_args(prefill_param_, model_args, parallel_args, true);
   param_from_args(decode_graph_param_, model_args, parallel_args, false);
+  decode_optimized_graph_param_ = decode_graph_param_;
+  const bool is_target_nz_decode_shape =
+      model_args.hidden_size() == kOptimizedHiddenSize &&
+      model_args.intermediate_size() ==
+          kOptimizedIntermediateSizePerRank * parallel_args.world_size();
+  enable_low_latency_quant_matmul_ =
+      quantize_type_ == "w8a8" && decode_graph_param_.isBF16 &&
+      is_target_nz_decode_shape &&
+      decode_graph_param_.enableAclGraphPagedAttention &&
+      decode_graph_param_.matmulBackend ==
+          atb_speed::common::OpBackend::ACLNN &&
+      !decode_graph_param_.enableLora && !decode_graph_param_.enableFlashComm &&
+      atb_speed::common::IsA2() &&
+      atb_speed::common::QuantMatmulNzSwigluDecodeOperation::is_available();
+  decode_optimized_graph_param_.enableQuantMatmulNzSwigluDecode =
+      enable_low_latency_quant_matmul_;
   decode_eager_param_ = decode_graph_param_;
   decode_eager_param_.enableAclGraphPagedAttention = false;
   atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
@@ -227,21 +265,45 @@ int64_t NpuQwen3DecoderLayerImpl::init_layer() {
     Qwen3DecoderLoader* qwen3_loader =
         dynamic_cast<Qwen3DecoderLoader*>(loader_.get());
     if (qwen3_loader && qwen3_loader->down_proj_quantized()) {
+      if (enable_low_latency_quant_matmul_ &&
+          !atb_speed::common::QuantMatmulNzDecodeOperation::is_available()) {
+        enable_low_latency_quant_matmul_ = false;
+        decode_optimized_graph_param_.enableQuantMatmulNzSwigluDecode = false;
+      }
       auto update_down_proj = [](atb_speed::qwen::QwenLayerParam& p) {
         p.linearDescs[atb_speed::common::DOWN_LINEAR_INDEX] =
             static_cast<int>(LinearTypeV2::W8A8);
         p.linearQuantType[atb_speed::common::DOWN_LINEAR_INDEX] =
             static_cast<int>(LinearType::INT);
+        p.enableSwigluQuant = true;
       };
       update_down_proj(prefill_param_);
       update_down_proj(decode_graph_param_);
+      update_down_proj(decode_optimized_graph_param_);
       update_down_proj(decode_eager_param_);
+    }
+    if (qwen3_loader && !qwen3_loader->o_proj_quantized()) {
+      constexpr uint64_t kDenseLinearIndex = 3;
+      auto update_o_proj = [](atb_speed::qwen::QwenLayerParam& p) {
+        p.linearDescs[kDenseLinearIndex] =
+            static_cast<int>(LinearTypeV2::BFLOAT16);
+        p.linearQuantType[kDenseLinearIndex] =
+            static_cast<int>(LinearType::INVALID);
+      };
+      update_o_proj(prefill_param_);
+      update_o_proj(decode_graph_param_);
+      update_o_proj(decode_optimized_graph_param_);
+      update_o_proj(decode_eager_param_);
     }
   }
 
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
   CHECK_OPERATION_STATUS_RETURN(
       init_node(decode_graph_node_, decode_graph_param_));
+  if (enable_low_latency_quant_matmul_) {
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(decode_optimized_graph_node_, decode_optimized_graph_param_));
+  }
   CHECK_OPERATION_STATUS_RETURN(
       init_node(decode_eager_node_, decode_eager_param_));
 
@@ -309,8 +371,14 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
     const bool use_graph_decode_input =
         ::xllm::ExecutionConfig::get_instance().enable_graph() &&
         input_params.graph.tiling_data.defined();
-    auto& decode_node =
-        use_graph_decode_input ? decode_graph_node_ : decode_eager_node_;
+    const bool use_low_latency_decode = use_graph_decode_input &&
+                                        enable_low_latency_quant_matmul_ &&
+                                        is_low_latency_decode_bucket(x);
+    atb_speed::Model::Node& decode_node =
+        use_graph_decode_input
+            ? (use_low_latency_decode ? decode_optimized_graph_node_
+                                      : decode_graph_node_)
+            : decode_eager_node_;
     build_node_variant_pack(decode_node,
                             x,
                             cos_pos,
