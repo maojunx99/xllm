@@ -8,6 +8,7 @@
 
 | 投影 | 每卡矩阵形状 |
 | --- | --- |
+| QKV | `[M,5120] × [5120,1280]` |
 | Gate/Up | `[M,5120] × [5120,6400]` |
 | Down | `[M,3200] × [3200,5120]` |
 
@@ -18,6 +19,7 @@
 - Qwen3 W8A8；
 - hidden size 为 5120；
 - TP 后每卡 intermediate size 为 3200；
+- TP 后每卡 packed QKV 输出维度为 1280；
 - BF16 模型路径；
 - ACLNN matmul backend；
 - ACL Graph paged attention；
@@ -30,7 +32,10 @@
 
 不满足条件时继续使用原有实现，因此 prefill、较大 batch、其他模型和其他 shape 不受影响。
 
-> 当前正式定制优化覆盖 Gate/Up 和量化 Down Projection。QKV 虽然已经是 W8A8，但仍走原来的 ACLNN QuantMatmul，没有进入本次定制核。
+当前正式定制优化覆盖 packed QKV、Gate/Up 和量化 Down Projection。
+QKV 和 Down 复用同一个 `QuantMatmulNzDecodeOperation` 图节点，但在
+host tiling 中根据 shape 选择不同 kernel specialization；不存在执行期
+C++ wrapper 动态路由。
 
 ## 2. Gate/Up 融合算子
 
@@ -337,6 +342,42 @@ Gate/Up 单算子复测结果如下：
 目标 M 范围内的回退。M=1/2/4/8/16 的最终 INT8 输出 SHA256 均与
 修改前定制核一致，说明本轮变化只改变调度，不改变数值结果。
 
+### 7.5 QKV专用kernel与图内路由
+
+`QuantMatmulNzDecode` 新增 QKV tiling key，仅接受
+`K=5120,N=1280,M=1–16`：
+
+- 10个AIC block，对应10个 `N=128` 分块；
+- L1 tile 为 `128×1536`；
+- L0 tile 为 `128×256`；
+- 开启K方向shuffle；
+- QKV权重保留普通L2 cache，Gate/Down仍沿用原有cache策略。
+
+图内路由链为：
+
+```text
+Qwen3 optimized decode graph
+    ↓ enableQuantMatmulNzQkvDecode
+FusionAttentionParam
+    ↓ packed QKV only
+QKVLinearSplit / NormLinear
+    ↓ FusionLinearParam::enableQuantMatmulNzDecode
+QuantMatmulNzDecodeOperation
+    ↓ tiling key 4
+QKV专用NZ kernel
+```
+
+路由仅在原有低延迟图条件全部满足，并且每卡packed QKV输出维度恰好为
+1280时启用。Prefill、eager decode、M大于16、非packed QKV、其他TP
+配置和其他模型仍使用原始算子。
+
+独立QKV测试中，M=1/2/4/8/16的BF16输出均与官方算子逐bit一致。
+无外部负载干扰的稳定轮次中，QKV单算子约从19.5 µs降至
+12.4–12.8 µs，降低约35%–36%。32层Gate/Down→QKV链路中，启用
+QKV定制核在已优化MLP链基础上额外减少12.782 µs/层；整条链相对
+全官方路径减少49.670 µs/层。共享机器存在其他进程占用NPU时绝对值
+会明显抖动，因此最终服务收益仍需以真实请求同轮A/B profiling为准。
+
 ## 8. 带宽和理论上限
 
 针对 NZ 权重搬运的独立测试：
@@ -424,13 +465,13 @@ AddRMSNormQuant
 
 当前尚未完成以下定制优化：
 
-- QKV Projection：`K=5120,N=1280`；
 - Attention O-proj 的专属小 M kernel；
 - AddRMSNormQuant + QKV融合；
 - AddRMSNormQuant + Gate/Up的有效物理融合；
 - Attention与QKV的跨算子融合。
 
-当前 `QuantMatmulNzDecode` host tiling 会拒绝 QKV shape，因此 QKV 仍使用官方 `aclnnQuantMatmul`。
+QKV Projection 的专用kernel和optimized decode graph路由已经完成；下一步
+融合方向是消除QKV前置AddRMSNormQuant的中间INT8落盘和额外启动开销。
 
 ## 12. 代码和提交位置
 
@@ -450,10 +491,10 @@ perf/qwen3vl-decode-kernels
 
 | 仓库 | Commit | 说明 |
 | --- | --- | --- |
-| xLLM根仓库 | `80c0cf1e` | Qwen3-VL loader、图节点和shape路由 |
-| xllm_ops | `fe4ccc9` | 两个NZ decode定制算子 |
+| xLLM根仓库 | 当前分支 | Qwen3-VL loader、图节点和精确shape路由 |
+| xllm_ops | `9f1c3d0` | Gate/Down/QKV NZ decode定制kernel |
 | Catlass | `48e2d23` | 非对称L1/L0 tiling支持 |
-| xllm_atb_layers | `47bc8ce` | ACLNN wrapper和ATB图内接入 |
+| xllm_atb_layers | `d71ac0a` | ACLNN wrapper和Gate/Down/QKV图内接入 |
 
 主要源码：
 
