@@ -34,6 +34,9 @@ namespace xllm {
 namespace {
 
 constexpr int32_t kNzAlignment = 16;
+constexpr int64_t kMegaGdnHeadDim = 128;
+constexpr int64_t kMegaGdnWorkspaceSafetyBytes = 384LL * 1024 * 1024;
+constexpr int64_t kMegaGdnWorkspaceAlignmentBytes = 16LL * 1024 * 1024;
 
 int64_t kv_cache_dtype_size(const std::string& kv_cache_dtype,
                             int64_t model_dtype_size) {
@@ -593,6 +596,64 @@ void init_standard_counts(const ModelArgs& model_args,
 }
 
 }  // namespace
+
+int64_t estimate_mega_gdn_prefill_workspace_reserve(
+    const ModelArgs& model_args,
+    int64_t max_tokens_per_batch,
+    int64_t n_local_linear_k_heads,
+    int64_t n_local_linear_v_heads,
+    bool is_draft_engine) {
+#if defined(USE_NPU)
+  const auto model_dtype = try_get_scalar_type_from_string(model_args.dtype());
+  const bool supported_value_heads =
+      n_local_linear_v_heads == 1 || n_local_linear_v_heads == 2 ||
+      n_local_linear_v_heads == 3 || n_local_linear_v_heads == 4 ||
+      n_local_linear_v_heads == 6 || n_local_linear_v_heads == 8 ||
+      n_local_linear_v_heads == 12 || n_local_linear_v_heads == 16 ||
+      n_local_linear_v_heads == 24 || n_local_linear_v_heads == 32 ||
+      n_local_linear_v_heads == 48 || n_local_linear_v_heads == 64;
+  if (is_draft_engine ||
+      !is_qwen3_5_target_model_type(model_args.model_type()) ||
+      !model_dtype.has_value() || model_dtype.value() != torch::kBFloat16 ||
+      resolve_ssm_dtype(model_args.mamba_ssm_dtype(), model_dtype.value()) !=
+          torch::kFloat32 ||
+      model_args.linear_key_head_dim() != kMegaGdnHeadDim ||
+      model_args.linear_value_head_dim() != kMegaGdnHeadDim ||
+      max_tokens_per_batch <= 0 || n_local_linear_k_heads <= 0 ||
+      !supported_value_heads ||
+      n_local_linear_v_heads % n_local_linear_k_heads != 0) {
+    return 0;
+  }
+
+  // MegaGdnPrefillOp keeps packed QKV, gates, WY/H/O intermediates and final
+  // state in one ACLNN workspace. The dominant token-scaled terms are 2*C
+  // bytes for packed BF16 QKV, 12*NV*D bytes for the BF16 matrix pipeline,
+  // and 18*NV bytes for FP32/BF16 gate buffers. Keep an additional fixed
+  // margin for per-core tiles, ACLNN workspace and allocator alignment.
+  const int64_t conv_dim =
+      (2 * n_local_linear_k_heads + n_local_linear_v_heads) * kMegaGdnHeadDim;
+  const __int128 bytes_per_token =
+      2 * static_cast<__int128>(conv_dim) +
+      12 * static_cast<__int128>(n_local_linear_v_heads) * kMegaGdnHeadDim +
+      18 * static_cast<__int128>(n_local_linear_v_heads);
+  const __int128 raw_bytes =
+      bytes_per_token * max_tokens_per_batch + kMegaGdnWorkspaceSafetyBytes;
+  CHECK(raw_bytes <=
+        static_cast<__int128>(std::numeric_limits<int64_t>::max()))
+      << "MegaGDN prefill workspace reserve overflows int64";
+  const int64_t bytes = static_cast<int64_t>(raw_bytes);
+  return ((bytes + kMegaGdnWorkspaceAlignmentBytes - 1) /
+          kMegaGdnWorkspaceAlignmentBytes) *
+         kMegaGdnWorkspaceAlignmentBytes;
+#else
+  (void)model_args;
+  (void)max_tokens_per_batch;
+  (void)n_local_linear_k_heads;
+  (void)n_local_linear_v_heads;
+  (void)is_draft_engine;
+  return 0;
+#endif
+}
 
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,

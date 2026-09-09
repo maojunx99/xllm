@@ -1744,6 +1744,42 @@ struct MegaChunkGdnParams {
   bool use_qk_l2norm_in_kernel = false;
 };
 
+struct MegaGdnMtpDecodeParams {
+  torch::Tensor qkv;
+  torch::Tensor z;
+  torch::Tensor b;
+  torch::Tensor a;
+  torch::Tensor conv_weight;
+  torch::Tensor conv_state;
+  torch::Tensor A_log;
+  torch::Tensor dt_bias;
+  torch::Tensor ssm_state;
+  torch::Tensor read_state_indices;
+  torch::Tensor write_state_indices;
+  torch::Tensor num_accepted_tokens;
+  torch::Tensor norm_weight;
+  bool fla_ssm_state_layout = true;
+};
+
+struct MegaGdnPrefillParams {
+  torch::Tensor mixed_qkv;
+  torch::Tensor b;
+  torch::Tensor a;
+  torch::Tensor z;
+  torch::Tensor conv_weight;
+  torch::Tensor conv_state;
+  torch::Tensor A_log;
+  torch::Tensor dt_bias;
+  torch::Tensor conv_state_read_indices;
+  torch::Tensor conv_state_write_indices;
+  torch::Tensor ssm_state_read_indices;
+  torch::Tensor ssm_state_write_indices;
+  torch::Tensor ssm_cache;
+  torch::Tensor cu_seqlens;
+  torch::Tensor norm_weight;
+  int64_t num_matrices = 0;
+};
+
 struct HcPostParams {
   torch::Tensor x;
   torch::Tensor residual;

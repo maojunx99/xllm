@@ -2150,6 +2150,245 @@ std::pair<torch::Tensor, torch::Tensor> mega_chunk_gdn(
 #endif
 }
 
+torch::Tensor mega_gdn_mtp_decode(MegaGdnMtpDecodeParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_mega_gdn_mtp_decode(params.qkv,
+                                      params.z,
+                                      params.b,
+                                      params.a,
+                                      params.conv_weight,
+                                      params.conv_state,
+                                      params.A_log,
+                                      params.dt_bias,
+                                      params.ssm_state,
+                                      params.read_state_indices,
+                                      params.write_state_indices,
+                                      params.num_accepted_tokens,
+                                      params.norm_weight,
+                                      params.fla_ssm_state_layout);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+bool supports_mega_gdn_mtp_decode(const MegaGdnMtpDecodeParams& params) {
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kMaxBatchSize = 32;
+  constexpr int64_t kMaxSequenceLength = 17;
+  constexpr int64_t kMaxCacheSlots = 1024;
+
+  if (!params.fla_ssm_state_layout || !params.qkv.defined() ||
+      !params.z.defined() || !params.b.defined() || !params.a.defined() ||
+      !params.conv_weight.defined() || !params.conv_state.defined() ||
+      !params.A_log.defined() || !params.dt_bias.defined() ||
+      !params.ssm_state.defined() || !params.read_state_indices.defined() ||
+      !params.write_state_indices.defined() ||
+      !params.num_accepted_tokens.defined() || !params.norm_weight.defined()) {
+    return false;
+  }
+  if (params.qkv.dim() != 3 || params.z.dim() != 4 || params.b.dim() != 3 ||
+      params.a.dim() != 3 || params.conv_weight.dim() != 2 ||
+      params.conv_state.dim() != 3 || params.A_log.dim() != 1 ||
+      params.dt_bias.dim() != 1 || params.ssm_state.dim() != 4 ||
+      params.read_state_indices.dim() != 1 ||
+      params.write_state_indices.dim() != 1 ||
+      params.num_accepted_tokens.dim() != 1 || params.norm_weight.dim() != 1) {
+    return false;
+  }
+
+  const int64_t batch_size = params.qkv.size(0);
+  const int64_t sequence_length = params.qkv.size(1);
+  const int64_t conv_dim = params.qkv.size(2);
+  const int64_t num_v_heads = params.z.size(2);
+  const int64_t qk_width = conv_dim - num_v_heads * kHeadDim;
+  if (batch_size < 1 || batch_size > kMaxBatchSize || sequence_length < 2 ||
+      sequence_length > kMaxSequenceLength || qk_width <= 0 ||
+      qk_width % (2 * kHeadDim) != 0) {
+    return false;
+  }
+  const int64_t num_k_heads = qk_width / (2 * kHeadDim);
+  const bool valid_head_geometry =
+      num_k_heads >= 1 && num_k_heads <= 16 &&
+      (num_k_heads & (num_k_heads - 1)) == 0 &&
+      num_v_heads % num_k_heads == 0 && num_v_heads / num_k_heads >= 1 &&
+      num_v_heads / num_k_heads <= 4;
+  if (!valid_head_geometry) {
+    return false;
+  }
+
+  const int64_t cache_slots = params.conv_state.size(0);
+  const bool valid_shapes =
+      params.z.sizes() ==
+          torch::IntArrayRef(
+              {batch_size, sequence_length, num_v_heads, kHeadDim}) &&
+      params.b.sizes() ==
+          torch::IntArrayRef({batch_size, sequence_length, num_v_heads}) &&
+      params.a.sizes() == params.b.sizes() &&
+      params.conv_weight.sizes() == torch::IntArrayRef({4, conv_dim}) &&
+      cache_slots >= 1 && cache_slots <= kMaxCacheSlots &&
+      params.conv_state.sizes() ==
+          torch::IntArrayRef({cache_slots, sequence_length + 2, conv_dim}) &&
+      params.A_log.sizes() == torch::IntArrayRef({num_v_heads}) &&
+      params.dt_bias.sizes() == torch::IntArrayRef({num_v_heads}) &&
+      params.ssm_state.sizes() ==
+          torch::IntArrayRef({cache_slots * sequence_length,
+                              num_v_heads,
+                              kHeadDim,
+                              kHeadDim}) &&
+      params.read_state_indices.sizes() == torch::IntArrayRef({batch_size}) &&
+      params.write_state_indices.sizes() == torch::IntArrayRef({batch_size}) &&
+      params.num_accepted_tokens.sizes() == torch::IntArrayRef({batch_size}) &&
+      params.norm_weight.sizes() == torch::IntArrayRef({kHeadDim});
+  const bool valid_dtypes =
+      params.qkv.scalar_type() == torch::kBFloat16 &&
+      params.z.scalar_type() == torch::kBFloat16 &&
+      params.b.scalar_type() == torch::kBFloat16 &&
+      params.a.scalar_type() == torch::kBFloat16 &&
+      params.conv_weight.scalar_type() == torch::kBFloat16 &&
+      params.conv_state.scalar_type() == torch::kBFloat16 &&
+      params.norm_weight.scalar_type() == torch::kBFloat16 &&
+      params.A_log.scalar_type() == torch::kFloat32 &&
+      params.dt_bias.scalar_type() == torch::kFloat32 &&
+      params.ssm_state.scalar_type() == torch::kFloat32 &&
+      params.read_state_indices.scalar_type() == torch::kInt32 &&
+      params.write_state_indices.scalar_type() == torch::kInt32 &&
+      params.num_accepted_tokens.scalar_type() == torch::kInt32;
+  // Cache tensors are mutated in place, so copying them to satisfy the custom
+  // op would lose state updates. Read-only inputs are normalized at the
+  // callsite after this policy check and may safely be non-contiguous here.
+  const bool mutable_caches_contiguous = params.conv_state.is_contiguous() &&
+                                         params.ssm_state.is_contiguous();
+  return valid_shapes && valid_dtypes && mutable_caches_contiguous;
+}
+
+torch::Tensor mega_gdn_prefill(MegaGdnPrefillParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_mega_gdn_prefill(params.mixed_qkv,
+                                   params.b,
+                                   params.a,
+                                   params.z,
+                                   params.conv_weight,
+                                   params.conv_state,
+                                   params.A_log,
+                                   params.dt_bias,
+                                   params.conv_state_read_indices,
+                                   params.conv_state_write_indices,
+                                   params.ssm_state_read_indices,
+                                   params.ssm_state_write_indices,
+                                   params.ssm_cache,
+                                   params.cu_seqlens,
+                                   params.norm_weight,
+                                   params.num_matrices);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+bool supports_mega_gdn_prefill(const MegaGdnPrefillParams& params) {
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kMaxCacheSlots = 1024;
+  if (!params.mixed_qkv.defined() || !params.z.defined() ||
+      !params.b.defined() || !params.a.defined() ||
+      !params.conv_weight.defined() || !params.conv_state.defined() ||
+      !params.A_log.defined() || !params.dt_bias.defined() ||
+      !params.conv_state_read_indices.defined() ||
+      !params.conv_state_write_indices.defined() ||
+      !params.ssm_state_read_indices.defined() ||
+      !params.ssm_state_write_indices.defined() ||
+      !params.ssm_cache.defined() || !params.cu_seqlens.defined() ||
+      !params.norm_weight.defined() || params.num_matrices <= 0) {
+    return false;
+  }
+  if (params.mixed_qkv.dim() != 2 || params.z.dim() != 3 ||
+      params.b.dim() != 2 || params.a.dim() != 2 ||
+      params.conv_weight.dim() != 2 || params.conv_state.dim() != 3 ||
+      params.A_log.dim() != 1 || params.dt_bias.dim() != 1 ||
+      params.conv_state_read_indices.dim() != 1 ||
+      params.conv_state_write_indices.dim() != 1 ||
+      params.ssm_state_read_indices.dim() != 1 ||
+      params.ssm_state_write_indices.dim() != 1 ||
+      params.ssm_cache.dim() != 4 || params.cu_seqlens.dim() != 1 ||
+      params.norm_weight.dim() != 1) {
+    return false;
+  }
+
+  const int64_t total_tokens = params.mixed_qkv.size(0);
+  const int64_t conv_dim = params.mixed_qkv.size(1);
+  const int64_t num_v_heads = params.z.size(1);
+  const int64_t batch_size = params.conv_state_read_indices.numel();
+  const int64_t cache_slots = params.conv_state.size(0);
+  const int64_t qk_width = conv_dim - num_v_heads * kHeadDim;
+  if (total_tokens < 1 || batch_size < 1 || cache_slots < 1 ||
+      cache_slots > kMaxCacheSlots || qk_width <= 0 ||
+      qk_width % (2 * kHeadDim) != 0 ||
+      params.ssm_cache.size(0) % cache_slots != 0) {
+    return false;
+  }
+  const int64_t num_k_heads = qk_width / (2 * kHeadDim);
+  const int64_t checkpoint_stride = params.ssm_cache.size(0) / cache_slots;
+  const bool supported_v_heads =
+      num_v_heads == 1 || num_v_heads == 2 || num_v_heads == 3 ||
+      num_v_heads == 4 || num_v_heads == 6 || num_v_heads == 8 ||
+      num_v_heads == 12 || num_v_heads == 16 || num_v_heads == 24 ||
+      num_v_heads == 32 || num_v_heads == 48 || num_v_heads == 64;
+  const bool valid_head_geometry =
+      supported_v_heads && num_k_heads >= 1 && num_v_heads % num_k_heads == 0;
+  const bool valid_shapes =
+      valid_head_geometry &&
+      params.z.sizes() ==
+          torch::IntArrayRef({total_tokens, num_v_heads, kHeadDim}) &&
+      params.b.sizes() == torch::IntArrayRef({total_tokens, num_v_heads}) &&
+      params.a.sizes() == params.b.sizes() &&
+      params.conv_weight.sizes() == torch::IntArrayRef({4, conv_dim}) &&
+      params.conv_state.sizes() ==
+          torch::IntArrayRef({cache_slots, checkpoint_stride + 2, conv_dim}) &&
+      params.A_log.sizes() == torch::IntArrayRef({num_v_heads}) &&
+      params.dt_bias.sizes() == torch::IntArrayRef({num_v_heads}) &&
+      params.ssm_cache.sizes() ==
+          torch::IntArrayRef({cache_slots * checkpoint_stride,
+                              num_v_heads,
+                              kHeadDim,
+                              kHeadDim}) &&
+      params.conv_state_write_indices.sizes() ==
+          torch::IntArrayRef({batch_size}) &&
+      params.ssm_state_read_indices.sizes() ==
+          torch::IntArrayRef({batch_size}) &&
+      params.ssm_state_write_indices.sizes() ==
+          torch::IntArrayRef({batch_size}) &&
+      params.cu_seqlens.sizes() == torch::IntArrayRef({batch_size + 1}) &&
+      params.norm_weight.sizes() == torch::IntArrayRef({kHeadDim}) &&
+      checkpoint_stride >= 1 && params.num_matrices % num_v_heads == 0 &&
+      params.num_matrices <= total_tokens * num_v_heads;
+  const bool valid_dtypes =
+      params.mixed_qkv.scalar_type() == torch::kBFloat16 &&
+      params.z.scalar_type() == torch::kBFloat16 &&
+      params.b.scalar_type() == torch::kBFloat16 &&
+      params.a.scalar_type() == torch::kBFloat16 &&
+      params.conv_weight.scalar_type() == torch::kBFloat16 &&
+      params.conv_state.scalar_type() == torch::kBFloat16 &&
+      params.norm_weight.scalar_type() == torch::kBFloat16 &&
+      params.A_log.scalar_type() == torch::kFloat32 &&
+      params.dt_bias.scalar_type() == torch::kFloat32 &&
+      params.ssm_cache.scalar_type() == torch::kFloat32 &&
+      params.conv_state_read_indices.scalar_type() == torch::kInt32 &&
+      params.conv_state_write_indices.scalar_type() == torch::kInt32 &&
+      params.ssm_state_read_indices.scalar_type() == torch::kInt32 &&
+      params.ssm_state_write_indices.scalar_type() == torch::kInt32 &&
+      params.cu_seqlens.scalar_type() == torch::kInt32;
+  const bool contiguous =
+      params.mixed_qkv.is_contiguous() && params.z.is_contiguous() &&
+      params.b.is_contiguous() && params.a.is_contiguous() &&
+      params.conv_weight.is_contiguous() && params.conv_state.is_contiguous() &&
+      params.A_log.is_contiguous() && params.dt_bias.is_contiguous() &&
+      params.conv_state_read_indices.is_contiguous() &&
+      params.conv_state_write_indices.is_contiguous() &&
+      params.ssm_state_read_indices.is_contiguous() &&
+      params.ssm_state_write_indices.is_contiguous() &&
+      params.ssm_cache.is_contiguous() && params.cu_seqlens.is_contiguous() &&
+      params.norm_weight.is_contiguous();
+  return valid_shapes && valid_dtypes && contiguous;
+}
+
 void npu_inplace_partial_rotary_mul(NpuInplacePartialRotaryMulParams& params) {
 #if defined(USE_NPU)
   npu::npu_inplace_partial_rotary_mul(params.x,

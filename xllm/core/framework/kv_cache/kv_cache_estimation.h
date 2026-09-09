@@ -86,6 +86,16 @@ int64_t estimate_layerwise_split_block_count(
     int64_t available_bytes,
     int64_t additional_block_bytes);
 
+// Reserves transient device memory used by the fused Qwen3.5 MegaGDN prefill
+// operator before the remaining capacity is assigned to KV cache. Returns zero
+// for unsupported models/platforms and draft engines.
+int64_t estimate_mega_gdn_prefill_workspace_reserve(
+    const ModelArgs& model_args,
+    int64_t max_tokens_per_batch,
+    int64_t n_local_linear_k_heads,
+    int64_t n_local_linear_v_heads,
+    bool is_draft_engine);
+
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);

@@ -19,6 +19,10 @@ limitations under the License.
 
 namespace xllm {
 
+bool can_reuse_tp_group_for_moe(int32_t dp_size,
+                                int32_t tp_size,
+                                int32_t moe_tp_size);
+
 class CollectiveCommunicator : public CollectiveCommunicatorBase {
  public:
   CollectiveCommunicator(int global_rank,

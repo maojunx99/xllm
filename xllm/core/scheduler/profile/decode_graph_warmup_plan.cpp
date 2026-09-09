@@ -90,9 +90,11 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
     return plan;
   }
 
+  const bool can_bound_no_padding_graphs =
+      !execution_shape.enable_graph_mode_decode_no_padding ||
+      execution_shape.max_graph_batch_size > 0;
   const bool use_mtp_batches =
-      !execution_shape.enable_graph_mode_decode_no_padding &&
-      execution_shape.num_decoding_tokens > 1 &&
+      can_bound_no_padding_graphs && execution_shape.num_decoding_tokens > 1 &&
       max_global_batch_size >= dp_size && dp_size > 0;
   if (!use_mtp_batches) {
     return plan;

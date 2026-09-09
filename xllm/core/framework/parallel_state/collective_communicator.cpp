@@ -46,6 +46,12 @@ limitations under the License.
 
 namespace xllm {
 
+bool can_reuse_tp_group_for_moe(int32_t dp_size,
+                                int32_t tp_size,
+                                int32_t moe_tp_size) {
+  return dp_size == 1 && tp_size == moe_tp_size;
+}
+
 #if defined(USE_NPU)
 namespace {
 
@@ -590,7 +596,18 @@ void CollectiveCommunicator::create_process_groups(
   int32_t moe_tp_size = world_size / ep_size;
   CHECK_EQ(moe_tp_size * ep_size, world_size);
   if (ep_size == 1) {
-    parallel_args_->moe_tp_group_ = process_group_.get();
+    // With DP1, world_group and tp_group contain the same ranks. Reusing the
+    // TP communicator keeps dense and MoE all-reduces on one HCCL/AIV
+    // resource instead of alternating between two equivalent communicators.
+    const bool reuse_tp_group_for_moe =
+        can_reuse_tp_group_for_moe(dp_size, tp_size, moe_tp_size);
+    parallel_args_->moe_tp_group_ = reuse_tp_group_for_moe
+                                        ? tp_group_.get()
+                                        : process_group_.get();
+    if (reuse_tp_group_for_moe) {
+      LOG(INFO) << "MoE TP communicator reuses TP group: tp_size=" << tp_size
+                << ", dp_size=" << dp_size;
+    }
     parallel_args_->eplb_group_ = process_group_.get();
   } else {
     port_offset = global_rank / moe_tp_size + 1;

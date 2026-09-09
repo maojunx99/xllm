@@ -258,6 +258,14 @@ std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
 std::pair<torch::Tensor, torch::Tensor> mega_chunk_gdn(
     MegaChunkGdnParams& params);
 
+torch::Tensor mega_gdn_mtp_decode(MegaGdnMtpDecodeParams& params);
+
+bool supports_mega_gdn_mtp_decode(const MegaGdnMtpDecodeParams& params);
+
+torch::Tensor mega_gdn_prefill(MegaGdnPrefillParams& params);
+
+bool supports_mega_gdn_prefill(const MegaGdnPrefillParams& params);
+
 torch::Tensor recurrent_gated_delta_rule(
     const torch::Tensor& query,
     const torch::Tensor& key,

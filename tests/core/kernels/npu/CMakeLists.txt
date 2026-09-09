@@ -52,6 +52,18 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
+cc_test(
+  NAME
+    mega_gdn_mtp_decode_policy_test
+  SRCS
+    mega_gdn_mtp_decode_policy_test.cpp
+  DEPS
+    torch
+    kernels
+    unified_dlog
+    GTest::gtest_main
+)
+
 # build_cp_context is CompositeExplicitAutograd pure host index math, so this
 # runs on CPU with no NPU; it only needs the xllm_ops registrations linked in.
 cc_test(

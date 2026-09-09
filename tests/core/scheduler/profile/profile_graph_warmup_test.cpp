@@ -36,6 +36,16 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(StepTimeProfilePlanTest, NeverExceedsConfiguredSequenceCapacity) {
+  const std::vector<int32_t> batch_sizes =
+      build_step_time_profile_batch_sizes(/*max_seqs_per_batch=*/16);
+  ASSERT_FALSE(batch_sizes.empty());
+  EXPECT_EQ(batch_sizes.back(), 16);
+  EXPECT_TRUE(std::all_of(batch_sizes.begin(), batch_sizes.end(), [](int32_t x) {
+    return x >= 1 && x <= 16;
+  }));
+}
+
 Sequence make_sequence(size_t index, const std::vector<int32_t>& tokens) {
   RequestSamplingParam sampling_param;
   sampling_param.beam_width = 0;

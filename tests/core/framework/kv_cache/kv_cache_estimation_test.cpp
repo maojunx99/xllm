@@ -701,4 +701,66 @@ TEST(KVCacheEstimationTest,
   EXPECT_LT(capacity.n_blocks(), target_only_capacity.n_blocks());
 }
 
+#if defined(USE_NPU)
+TEST(KVCacheEstimationTest, MegaGdnPrefillWorkspaceReserveTracksTpShape) {
+  ModelArgs args;
+  args.model_type("qwen3_5_moe_text");
+  args.dtype("bfloat16");
+  args.mamba_ssm_dtype("float32");
+  args.linear_key_head_dim(128);
+  args.linear_value_head_dim(128);
+
+  const int64_t tp2_reserve =
+      estimate_mega_gdn_prefill_workspace_reserve(args,
+                                                  32768,
+                                                  /*n_local_linear_k_heads=*/4,
+                                                  /*n_local_linear_v_heads=*/12,
+                                                  /*is_draft_engine=*/false);
+  const int64_t tp4_reserve =
+      estimate_mega_gdn_prefill_workspace_reserve(args,
+                                                  32768,
+                                                  /*n_local_linear_k_heads=*/2,
+                                                  /*n_local_linear_v_heads=*/6,
+                                                  /*is_draft_engine=*/false);
+
+  EXPECT_GT(tp2_reserve, 1024LL * 1024 * 1024);
+  EXPECT_LT(tp2_reserve, 1280LL * 1024 * 1024);
+  EXPECT_GT(tp2_reserve, tp4_reserve);
+  EXPECT_EQ(tp2_reserve % (16LL * 1024 * 1024), 0);
+  EXPECT_EQ(estimate_mega_gdn_prefill_workspace_reserve(
+                args, 32768, 4, 12, /*is_draft_engine=*/true),
+            0);
+}
+
+TEST(KVCacheEstimationTest, MegaGdnPrefillWorkspaceReserveRequiresFusedPath) {
+  ModelArgs args;
+  args.model_type("qwen3_5_moe_text");
+  args.dtype("bfloat16");
+  args.mamba_ssm_dtype("float32");
+  args.linear_key_head_dim(128);
+  args.linear_value_head_dim(128);
+
+  const auto reserve = [&args](int64_t k_heads, int64_t v_heads) {
+    return estimate_mega_gdn_prefill_workspace_reserve(
+        args, 32768, k_heads, v_heads, /*is_draft_engine=*/false);
+  };
+  EXPECT_GT(reserve(4, 12), 0);
+
+  args.dtype("float16");
+  EXPECT_EQ(reserve(4, 12), 0);
+  args.dtype("bfloat16");
+
+  args.mamba_ssm_dtype("bfloat16");
+  EXPECT_EQ(reserve(4, 12), 0);
+  args.mamba_ssm_dtype("float32");
+
+  args.linear_key_head_dim(64);
+  EXPECT_EQ(reserve(4, 12), 0);
+  args.linear_key_head_dim(128);
+
+  EXPECT_EQ(reserve(5, 12), 0);
+  EXPECT_EQ(reserve(4, 5), 0);
+}
+#endif
+
 }  // namespace xllm

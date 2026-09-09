@@ -447,10 +447,25 @@ int64_t LLMEngine::get_effective_xtensor_weight_size(
 KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   const int64_t max_cache_size = options_.max_cache_size();
   const double max_memory_utilization = options_.max_memory_utilization();
+  const bool enable_xtensor =
+      ::xllm::KVCacheConfig::get_instance().enable_xtensor();
+  // XTensor owns a preallocated physical-page pool. Leaving pages unused does
+  // not make them available to the torch workspace allocator, so the fused
+  // prefill path is disabled under XTensor instead of pretending that a
+  // subtraction from the page budget reserves usable workspace memory.
+  const int64_t mega_gdn_workspace_reserve =
+      enable_xtensor
+          ? 0
+          : estimate_mega_gdn_prefill_workspace_reserve(
+                args_,
+                static_cast<int64_t>(options_.max_tokens_per_batch()),
+                n_local_linear_k_heads_,
+                n_local_linear_v_heads_,
+                options_.is_draft_engine());
 
   int64_t cache_size_in_bytes = std::numeric_limits<int64_t>::max();
 
-  if (::xllm::KVCacheConfig::get_instance().enable_xtensor()) {
+  if (enable_xtensor) {
     // For xtensor mode, use PhyPagePool's total pages * page_size
     auto& phy_pool = PhyPagePool::get_instance();
     CHECK(phy_pool.is_initialized()) << "PhyPagePool not initialized";
@@ -493,6 +508,15 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
             total_memory * (1.0 - max_memory_utilization);
         available_memory -= buffer_memory;
       }
+      if (mega_gdn_workspace_reserve > 0) {
+        available_memory -= mega_gdn_workspace_reserve;
+        LOG(INFO) << "worker #" << i << ": reserving "
+                  << readable_size(mega_gdn_workspace_reserve)
+                  << " for MegaGDN prefill workspace";
+      }
+      CHECK_GT(available_memory, 0)
+          << "No device memory remains for KV cache after runtime workspace "
+             "reservation";
       if (max_cache_size > 0) {
         available_memory = std::min(available_memory, max_cache_size);
       }

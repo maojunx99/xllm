@@ -36,6 +36,8 @@ class RmsNormGatedImpl : public torch::nn::Module {
 
   void load_state_dict(const StateDict& state_dict);
 
+  const torch::Tensor& weight() const { return weight_; }
+
  private:
   DEFINE_WEIGHT(weight);
   int64_t norm_dim_;

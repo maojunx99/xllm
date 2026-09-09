@@ -18,6 +18,7 @@ limitations under the License.
 #include <optional>
 #include <tuple>
 
+#include "core/framework/config/kv_cache_config.h"
 #include "xllm/core/kernels/npu/npu_ops_api.h"
 #include "xllm/core/kernels/ops_api.h"
 #include "xllm/core/platform/npu/acl_graph_task_update_context.h"
@@ -613,6 +614,129 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       get_checkpoint_stride(conv_cache, ssm_cache);
   torch::Tensor linear_state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+
+  xllm::kernel::MegaGdnMtpDecodeParams params;
+  if (use_spec_verify && input_params.num_accepted_tokens.defined()) {
+    params.qkv = mixed_qkv;
+    params.z = z;
+    params.b = b;
+    params.a = a;
+    params.conv_weight = conv_weight;
+    params.conv_state = conv_cache;
+    params.A_log = A_log_;
+    params.dt_bias = dt_bias_;
+    params.ssm_state = ssm_cache;
+    params.read_state_indices = expand_sequence_tensor_to_batch(
+        logical_state_indices, batch_size, "linear_state_indices");
+    params.write_state_indices = params.read_state_indices;
+    params.num_accepted_tokens = expand_sequence_tensor_to_batch(
+        input_params.num_accepted_tokens.to(device, torch::kInt32),
+        batch_size,
+        "num_accepted_tokens");
+    params.norm_weight = norm_->weight();
+    params.fla_ssm_state_layout = fla_ssm_state_layout;
+  }
+  // Select the fused operator before it can mutate cache state. Unsupported
+  // shapes retain the existing causal-conv and recurrent-GDN implementation.
+  const bool use_mega_gdn_mtp_decode =
+      conv_kernel_size_ == 4 && head_k_dim_ == 128 && head_v_dim_ == 128 &&
+      checkpoint_stride == seq_len &&
+      xllm::kernel::supports_mega_gdn_mtp_decode(params);
+  if (use_mega_gdn_mtp_decode) {
+    params.qkv = params.qkv.contiguous();
+    params.z = params.z.contiguous();
+    params.b = params.b.contiguous();
+    params.a = params.a.contiguous();
+    params.conv_weight = params.conv_weight.contiguous();
+    params.A_log = params.A_log.contiguous();
+    params.dt_bias = params.dt_bias.contiguous();
+    params.read_state_indices = params.read_state_indices.contiguous();
+    params.write_state_indices = params.write_state_indices.contiguous();
+    params.num_accepted_tokens = params.num_accepted_tokens.contiguous();
+    params.norm_weight = params.norm_weight.contiguous();
+    auto norm_out = xllm::kernel::mega_gdn_mtp_decode(params);
+    LOG_FIRST_N(INFO, 1) << "Using MegaGdnMtpDecode for Qwen3.5 MTP verify";
+    auto rearranged_norm =
+        norm_out.reshape({norm_out.size(0) * norm_out.size(1),
+                          norm_out.size(2) * norm_out.size(3)});
+    rearranged_norm = reshape_qkvz_unpad(attn_metadata, rearranged_norm);
+    if (rearranged_norm.size(0) > original_num_tokens) {
+      rearranged_norm =
+          rearranged_norm.slice(0, 0, original_num_tokens).contiguous();
+    }
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(rearranged_norm,
+                              row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(rearranged_norm);
+  }
+
+  if (split_inputs.has_value() && !use_spec_verify && is_any_prefill &&
+      fla_ssm_state_layout && conv_kernel_size_ == 4 && head_k_dim_ == 128 &&
+      head_v_dim_ == 128 && attn_metadata.has_initial_states.defined()) {
+    xllm::kernel::MegaGdnPrefillParams prefill_params;
+    prefill_params.mixed_qkv =
+        reshape_qkvz_unpad(attn_metadata, mixed_qkv).contiguous();
+    prefill_params.z = reshape_qkvz_unpad(attn_metadata, z)
+                           .view({-1, local_v_heads, head_v_dim_})
+                           .contiguous();
+    prefill_params.b =
+        reshape_qkvz_unpad(attn_metadata, b).view({-1, local_v_heads});
+    prefill_params.a =
+        reshape_qkvz_unpad(attn_metadata, a).view({-1, local_v_heads});
+    prefill_params.conv_weight = conv_weight.contiguous();
+    prefill_params.conv_state = conv_cache;
+    prefill_params.A_log = A_log_.contiguous();
+    prefill_params.dt_bias = dt_bias_.contiguous();
+    torch::Tensor has_initial_states =
+        attn_metadata.has_initial_states.to(torch::kBool).contiguous();
+    torch::Tensor invalid_conv_indices =
+        torch::full_like(logical_state_indices, -1);
+    prefill_params.conv_state_read_indices =
+        torch::where(
+            has_initial_states, logical_state_indices, invalid_conv_indices)
+            .contiguous();
+    prefill_params.conv_state_write_indices =
+        logical_state_indices.contiguous();
+    torch::Tensor invalid_ssm_indices =
+        torch::full_like(linear_state_base_indices, -1);
+    prefill_params.ssm_state_read_indices =
+        torch::where(
+            has_initial_states, linear_state_base_indices, invalid_ssm_indices)
+            .contiguous();
+    prefill_params.ssm_state_write_indices =
+        linear_state_base_indices.contiguous();
+    prefill_params.ssm_cache = ssm_cache;
+    prefill_params.cu_seqlens =
+        attn_metadata.q_cu_seq_lens.to(torch::kInt32).contiguous();
+    prefill_params.norm_weight = norm_->weight().contiguous();
+    for (const int32_t query_length : attn_metadata.q_seq_lens_vec) {
+      CHECK_GE(query_length, 0)
+          << "Qwen3.5 prefill length must be non-negative";
+      prefill_params.num_matrices +=
+          ((static_cast<int64_t>(query_length) + 127) / 128) * local_v_heads;
+    }
+    // XTensor preallocates its physical-page pool outside torch's workspace
+    // allocator. Until that allocator can reserve transient operator memory,
+    // retain the unfused prefill path rather than risking first-request OOM.
+    if (!::xllm::KVCacheConfig::get_instance().enable_xtensor() &&
+        xllm::kernel::supports_mega_gdn_prefill(prefill_params)) {
+      torch::Tensor norm_out = xllm::kernel::mega_gdn_prefill(prefill_params);
+      LOG_FIRST_N(INFO, 1) << "Using MegaGdnPrefillOp for Qwen3.5 prefill";
+      torch::Tensor rearranged_norm = norm_out.reshape(
+          {norm_out.size(0), norm_out.size(1) * norm_out.size(2)});
+      if (rearranged_norm.size(0) > original_num_tokens) {
+        rearranged_norm =
+            rearranged_norm.slice(0, 0, original_num_tokens).contiguous();
+      }
+      if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+        return o_proj_->forward(rearranged_norm,
+                                row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+      }
+      return o_proj_->forward(rearranged_norm);
+    }
+  }
+
   auto graph_context = input_params.graph.acl_graph_task_update_context;
   const bool register_conv1d_graph_update =
       graph_context != nullptr && graph_context->capturing;

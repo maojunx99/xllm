@@ -32,6 +32,10 @@ limitations under the License.
 
 namespace xllm {
 class Engine;
+
+std::vector<int32_t> build_step_time_profile_batch_sizes(
+    int32_t max_seqs_per_batch);
+
 class ProfileManager {
  public:
   struct Options {
