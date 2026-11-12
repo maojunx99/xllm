@@ -427,6 +427,19 @@ bool CommChannel::start_profile() {
   return true;
 }
 
+std::string CommChannel::static_kernel_control(const std::string& command) {
+  proto::StaticKernelControlRequest req;
+  req.set_command(command);
+  proto::StaticKernelControlResponse resp;
+  brpc::Controller cntl;
+  // Compiling and installing a cache miss can take much longer than inference.
+  cntl.set_timeout_ms(3600000);
+  cntl.set_max_retry(0);
+  stub_->StaticKernelControl(&cntl, &req, &resp, nullptr);
+  CHECK(!cntl.Failed()) << "StaticKernelControl failed: " << cntl.ErrorText();
+  return resp.result();
+}
+
 bool CommChannel::stop_profile() {
   proto::Empty req;
   proto::Status s;

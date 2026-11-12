@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 
+#include <glog/logging.h>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -30,6 +32,28 @@ DEFINE_bool(disable_graph_warmup,
             false,
             "Whether to skip synthetic graph warmup during engine startup. "
             "When enabled, graphs are captured lazily by real requests.");
+
+DEFINE_bool(enable_static_kernel,
+            false,
+            "Collect eager startup operator arguments, compile CANN static "
+            "kernels and load them before graph capture. NPU only; requires "
+            "CANN static compilation and custom-path reselection interfaces.");
+
+DEFINE_bool(enable_super_kernel,
+            false,
+            "Fuse eligible static kernel binaries after NPU ACL graph capture. "
+            "Requires --enable_static_kernel and --enable_graph; NPU only.");
+
+DEFINE_string(
+    static_kernel_cache_dir,
+    "",
+    "Private CANN static kernel cache directory. Empty selects "
+    "$XDG_CACHE_HOME/xllm/static_kernel or ~/.cache/xllm/static_kernel.");
+
+DEFINE_bool(super_kernel_auto_op_parallel,
+            false,
+            "Enable dependency-preserving Cube/Vector scheduling inside "
+            "SuperKernel. Only used when --enable_super_kernel=true.");
 
 DEFINE_bool(enable_graph_double_buffer,
             true,
@@ -120,6 +144,10 @@ DEFINE_bool(
 namespace xllm {
 
 void ExecutionConfig::from_flags() {
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_static_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_super_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(super_kernel_auto_op_parallel);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(static_kernel_cache_dir);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
@@ -139,6 +167,10 @@ void ExecutionConfig::from_flags() {
 }
 
 void ExecutionConfig::from_json(const JsonReader& json) {
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_static_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_super_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(super_kernel_auto_op_parallel);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(static_kernel_cache_dir);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
@@ -160,6 +192,14 @@ void ExecutionConfig::from_json(const JsonReader& json) {
 void ExecutionConfig::append_config_json(
     nlohmann::ordered_json& config_json) const {
   const ExecutionConfig default_config;
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_static_kernel);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_super_kernel);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, super_kernel_auto_op_parallel);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, static_kernel_cache_dir);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -204,6 +244,13 @@ void ExecutionConfig::initialize() {
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
   }
+  CHECK(!enable_super_kernel() || enable_static_kernel())
+      << "SuperKernel requires --enable_static_kernel=true";
+  CHECK(!enable_super_kernel() || enable_graph())
+      << "SuperKernel requires --enable_graph=true";
+#if !defined(USE_NPU)
+  CHECK(!enable_super_kernel()) << "SuperKernel requires an NPU build";
+#endif
 }
 
 }  // namespace xllm

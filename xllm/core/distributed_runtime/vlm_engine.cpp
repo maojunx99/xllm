@@ -104,6 +104,23 @@ runtime::DecodeGraphWarmupConfig VLMEngine::decode_graph_warmup_config() const {
   return warmup_config;
 }
 
+std::vector<std::string> VLMEngine::static_kernel_control(
+    const std::string& command) {
+  CHECK(!worker_clients_.empty());
+  std::vector<folly::SemiFuture<std::string>> futures;
+  futures.reserve(worker_clients_.size());
+  for (auto& worker : worker_clients_) {
+    futures.emplace_back(worker->static_kernel_control_async(command));
+  }
+  auto results = folly::collectAll(futures).get();
+  std::vector<std::string> reports;
+  reports.reserve(results.size());
+  for (const auto& result : results) {
+    reports.emplace_back(result.value());
+  }
+  return reports;
+}
+
 void VLMEngine::process_group_test() {
 #if !defined(USE_NPU)
   // In multi-node serving mode, only driver engine

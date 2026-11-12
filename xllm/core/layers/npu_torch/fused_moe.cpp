@@ -23,6 +23,7 @@ limitations under the License.
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -36,8 +37,11 @@ limitations under the License.
 #else
 #include <torch_npu/csrc/aten/NPUNativeFunctions.h>
 #endif
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
+#include "core/kernels/npu/npu_ops_api.h"
+#include "core/platform/npu/super_kernel.h"
 #include "framework/config/eplb_config.h"
 #include "framework/config/kernel_config.h"
 #include "framework/config/scheduler_config.h"
@@ -114,6 +118,38 @@ void activate_expert_slots(torch::Tensor& active,
 }  // namespace dsv4_eplb
 
 namespace {
+
+bool skip_moe_super_kernel() {
+  // Temporary native-capture experiment; ordinary Static Kernel and ACL Graph
+  // execution are unchanged. Keep the full-model scope as the default.
+  static const bool enabled = [] {
+    const char* value = std::getenv("XLLM_SUPER_KERNEL_SKIP_MOE");
+    const bool skip = value != nullptr && std::string(value) == "1";
+    if (skip) {
+      LOG(INFO) << "SuperKernel experiment: excluding complete MoE forwards";
+    }
+    return skip;
+  }();
+  return enabled;
+}
+
+c10_npu::NPUStream shared_expert_calculation_stream(
+    const torch::Device& device) {
+  // All MoE layers on a device share one auxiliary stream. Allocating one
+  // pooled stream per layer can wrap the pool and alias graph update streams.
+  static std::mutex mutex;
+  static std::unordered_map<int32_t, c10_npu::NPUStream> streams;
+  const std::lock_guard<std::mutex> guard(mutex);
+  const int32_t device_index = device.index();
+  const auto found = streams.find(device_index);
+  if (found != streams.end()) {
+    return found->second;
+  }
+  const auto stream =
+      c10_npu::getStreamFromPool(/*isHighPriority=*/false, device_index);
+  streams.emplace(device_index, stream);
+  return stream;
+}
 
 // Normalize dp_global_token_nums for MoE collectives. Under dp>1 an empty
 // dp_rank is padded with a single fake token by worker_impl (see the empty
@@ -599,10 +635,19 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   const std::string& topk_method = model_args.topk_method();
   int64_t ep_size = parallel_args.ep_size();
   int64_t ep_rank = 0;
+  enable_moe_finalize_routing_ =
+      ep_size > 1 &&
+      ::xllm::KernelConfig::get_instance().enable_moe_finalize_routing();
   if (parallel_args.moe_tp_group_ != nullptr) {
     tp_pg_ = parallel_args.moe_tp_group_;
   }
   CHECK(tp_pg_ != nullptr) << "FusedMoE requires a valid MoE TP group.";
+  if (n_shared_experts_ > 0 &&
+      ::xllm::KernelConfig::get_instance().enable_shared_expert_overlap()) {
+    shared_overlap_ =
+        std::make_unique<SharedExpertOverlapState>(SharedExpertOverlapState{
+            Stream(shared_expert_calculation_stream(options.device()))});
+  }
   if (ep_size > 1) {
     CHECK(parallel_args.moe_ep_group_ != nullptr)
         << "FusedMoE requires a valid MoE EP group when ep_size > 1.";
@@ -1800,11 +1845,10 @@ torch::Tensor FusedMoEImpl::select_experts(
                    : start_expert_id_;
   const int64_t local_expert_end =
       local_expert_start + local_physical_experts_num();
-  if (parallel_args_.ep_size() > 1) {
-    // The routing op uses global expert ids, but this rank only contributes
-    // outputs for its active expert range.
-    auto local_expert_mask = torch::logical_and(topk_ids >= local_expert_start,
-                                                topk_ids < local_expert_end);
+
+  if (parallel_args_.ep_size() > 1 && !enable_moe_finalize_routing_) {
+    const auto local_expert_mask = torch::logical_and(
+        topk_ids >= local_expert_start, topk_ids < local_expert_end);
     topk_weights = topk_weights * local_expert_mask.to(topk_weights.dtype());
   }
 
@@ -1836,7 +1880,13 @@ torch::Tensor FusedMoEImpl::select_experts(
 
   // collect the selected tensor
   selected_expert_info.reduce_weight = topk_weights;
-  selected_expert_info.combine_idx = expand_row_ids.abs();
+  // Finalize skips -1 routes directly. Legacy EP unpermute instead needs
+  // non-negative indices and the corresponding probabilities masked above.
+  // EP = 1 has no out-of-rank routes and needs neither mask nor Abs.
+  selected_expert_info.combine_idx =
+      parallel_args_.ep_size() > 1 && !enable_moe_finalize_routing_
+          ? expand_row_ids.abs()
+          : expand_row_ids;
   selected_expert_info.token_count_slice = group_list.to(torch::kInt64);
   selected_expert_info.cusum_token_count = group_list;
   return expand_hidden_states;
@@ -1889,7 +1939,8 @@ void FusedMoEImpl::ensure_mega_moe_weights() {
 torch::Tensor FusedMoEImpl::forward_mega_moe(
     const torch::Tensor& hidden_states,
     const torch::Tensor& router_logits,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    SharedExpertExecution* shared_execution) {
   CHECK(mega_moe_enabled_);
   auto comm = mega_moe_comm_resource_.lock();
   CHECK(comm != nullptr)
@@ -1998,6 +2049,12 @@ torch::Tensor FusedMoEImpl::forward_mega_moe(
   params.max_recv_token_num = max_recv_token_num;
   params.x_active_mask = x_active_mask;
 
+  if (shared_execution != nullptr) {
+    // MegaMoE exposes no GMM/combine milestones. Keep its fused kernel and
+    // overlap the independent shared branch after routing is ready.
+    enqueue_shared_expert_activation(*shared_execution);
+    enqueue_shared_expert_output(hidden_states, *shared_execution);
+  }
   auto [y, expert_token_nums] = xllm::kernel::mega_moe(params);
 
   (void)expert_token_nums;
@@ -2040,10 +2097,75 @@ torch::Tensor FusedMoEImpl::forward_expert(
     const std::optional<torch::Tensor>& shared_output,
     const ModelInputParams& input_params,
     bool use_mega_moe) {
+  npu::SuperKernelScopePause super_kernel_pause(skip_moe_super_kernel());
+  return forward_expert_impl(hidden_states,
+                             router_logits,
+                             shared_output,
+                             input_params,
+                             use_mega_moe,
+                             nullptr);
+}
+
+void FusedMoEImpl::enqueue_shared_expert_gate_up(
+    const torch::Tensor& input,
+    SharedExpertExecution& execution) {
+  execution.router_ready.record();
+  const auto guard = shared_overlap_->stream.set_stream_guard();
+  execution.router_ready.block(*shared_overlap_->stream.get_stream());
+  execution.gate_up = shared_experts_->forward_gate_up(input);
+}
+
+void FusedMoEImpl::enqueue_shared_expert_activation(
+    SharedExpertExecution& execution) {
+  execution.activation_ready.record();
+  const auto guard = shared_overlap_->stream.set_stream_guard();
+  execution.activation_ready.block(*shared_overlap_->stream.get_stream());
+  execution.activation = shared_experts_->forward_activation(execution.gate_up);
+}
+
+void FusedMoEImpl::enqueue_shared_expert_output(
+    const torch::Tensor& input,
+    SharedExpertExecution& execution) {
+  execution.combine_ready.record();
+  const auto guard = shared_overlap_->stream.set_stream_guard();
+  execution.combine_ready.block(*shared_overlap_->stream.get_stream());
+  execution.output = shared_experts_->forward_down(execution.activation);
+  if (should_apply_shared_expert_gate(shared_expert_gate_,
+                                      is_deepseek_v4_,
+                                      shared_expert_gate_is_loaded_)) {
+    const torch::Tensor gate = torch::sigmoid(
+        linear_with_weight_nz(input, shared_expert_gate_->weight));
+    execution.output = gate * execution.output;
+  }
+  execution.output_ready.record();
+}
+
+void FusedMoEImpl::wait_shared_expert_output(SharedExpertExecution& execution) {
+  const auto current = c10_npu::getCurrentNPUStream();
+  execution.output_ready.block(current);
+  // The output is allocated on the auxiliary stream and consumed on current.
+  // Keep its storage alive until the final add has completed on current.
+  c10_npu::NPUCachingAllocator::recordStream(
+      execution.output.storage().data_ptr(), current);
+}
+
+torch::Tensor FusedMoEImpl::forward_expert_impl(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& router_logits,
+    const std::optional<torch::Tensor>& shared_output,
+    const ModelInputParams& input_params,
+    bool use_mega_moe,
+    SharedExpertExecution* shared_execution) {
   if (use_mega_moe) {
-    auto output = forward_mega_moe(hidden_states, router_logits, input_params);
-    if (shared_output.has_value()) {
-      auto shared = shared_output.value();
+    auto output = forward_mega_moe(
+        hidden_states, router_logits, input_params, shared_execution);
+    std::optional<torch::Tensor> shared_result = shared_output;
+    if (shared_execution != nullptr) {
+      wait_shared_expert_output(*shared_execution);
+      shared_result = shared_execution->output;
+    }
+    if (shared_result.has_value()) {
+      auto shared = shared_result.value();
       if (tp_pg_->world_size() > 1) {
         shared = parallel_state::reduce(shared, tp_pg_);
       }
@@ -2114,6 +2236,10 @@ torch::Tensor FusedMoEImpl::forward_expert(
     apply_ds_v4_dequant_swiglu_quant_v2_params(params, swiglu_limit_);
     std::tie(act_quantized, act_scale) =
         xllm::kernel::dequant_swiglu_quant(params);
+
+    if (shared_execution != nullptr) {
+      enqueue_shared_expert_activation(*shared_execution);
+    }
 
     // Step 7: second grouped matmul (dequant to hidden dtype).
     ensure_group_gemm_weight_layout(w2_,
@@ -2211,6 +2337,10 @@ torch::Tensor FusedMoEImpl::forward_expert(
         << "dynamic_quant must return activation scale after W4A8_DYNAMIC "
         << "SwiGLU.";
 
+    if (shared_execution != nullptr) {
+      enqueue_shared_expert_activation(*shared_execution);
+    }
+
     {
       std::vector<torch::Tensor> x_list = {act_quantized};
       std::vector<torch::Tensor> weight_list = {w2_};
@@ -2253,6 +2383,12 @@ torch::Tensor FusedMoEImpl::forward_expert(
     torch::Tensor act_out;
     act_->forward(gemm1_out, act_out);
 
+    if (shared_execution != nullptr) {
+      // Delay shared Vector activation until routed Vector activation ends.
+      // It can then execute alongside routed GMM2 on the Cube cores.
+      enqueue_shared_expert_activation(*shared_execution);
+    }
+
     // Step 6: group gemm 2
     {
       xllm::kernel::GroupGemmParams group_gemm_params;
@@ -2271,21 +2407,38 @@ torch::Tensor FusedMoEImpl::forward_expert(
     }
   }
 
+  std::optional<torch::Tensor> shared_result = shared_output;
+  if (shared_execution != nullptr) {
+    // Shared Down uses Cube while the routed path combines tokens on Vector.
+    enqueue_shared_expert_output(hidden_states, *shared_execution);
+    shared_result = shared_execution->output;
+  }
+
   // Step 8: combine the intermediate results and get the final hidden states.
-  xllm::kernel::MoeCombineResultParams moe_combine_params;
-  moe_combine_params.input = gemm2_out;
-  moe_combine_params.reduce_weight = selected_expert_info.reduce_weight;
-  moe_combine_params.gather_ids = selected_expert_info.combine_idx;
-  torch::Tensor final_hidden_states =
-      xllm::kernel::moe_combine_result(moe_combine_params);
+  torch::Tensor final_hidden_states;
+  if (enable_moe_finalize_routing_) {
+    final_hidden_states = xllm::kernel::npu::apply_npu_moe_finalize_routing(
+        gemm2_out,
+        selected_expert_info.reduce_weight,
+        selected_expert_info.combine_idx);
+  } else {
+    xllm::kernel::MoeCombineResultParams moe_combine_params;
+    moe_combine_params.input = gemm2_out;
+    moe_combine_params.reduce_weight = selected_expert_info.reduce_weight;
+    moe_combine_params.gather_ids = selected_expert_info.combine_idx;
+    final_hidden_states = xllm::kernel::moe_combine_result(moe_combine_params);
+  }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);
 
-  if (shared_output.has_value()) {
+  if (shared_result.has_value()) {
     if (parallel_args_.ep_size() == 1) {
       // reduce(a) + reduce(b) == reduce(a + b). Combining the routed and shared
       // partial outputs avoids one small TP allreduce in each MoE decode layer.
-      final_hidden_states.add_(shared_output.value());
+      if (shared_execution != nullptr) {
+        wait_shared_expert_output(*shared_execution);
+      }
+      final_hidden_states.add_(shared_result.value());
       if (tp_pg_->world_size() > 1) {
         final_hidden_states =
             parallel_state::reduce(final_hidden_states, tp_pg_);
@@ -2298,7 +2451,10 @@ torch::Tensor FusedMoEImpl::forward_expert(
       final_hidden_states = parallel_state::reduce(
           final_hidden_states, parallel_args_.moe_ep_group_);
 
-      auto reduced_shared_output = shared_output.value();
+      if (shared_execution != nullptr) {
+        wait_shared_expert_output(*shared_execution);
+      }
+      auto reduced_shared_output = shared_result.value();
       if (tp_pg_->world_size() > 1) {
         reduced_shared_output =
             parallel_state::reduce(reduced_shared_output, tp_pg_);
@@ -2319,6 +2475,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
 
 torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
                                     const ModelInputParams& input_params) {
+  npu::SuperKernelScopePause super_kernel_pause(skip_moe_super_kernel());
   auto input = hidden_states;
   bool need_slice = false;
   std::vector<int32_t> moe_dp_token_nums;
@@ -2332,21 +2489,34 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   }
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
-  if (n_shared_experts_ > 0) {
+  SharedExpertExecution shared_execution;
+  torch::Tensor router_logits;
+  if (shared_overlap_ != nullptr) {
+    router_logits = gate_(input);
+    enqueue_shared_expert_gate_up(input, shared_execution);
+  } else if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
     if (should_apply_shared_expert_gate(shared_expert_gate_,
                                         is_deepseek_v4_,
                                         shared_expert_gate_is_loaded_)) {
-      torch::Tensor gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      torch::Tensor gate = torch::sigmoid(
+          linear_with_weight_nz(input, shared_expert_gate_->weight));
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
       }
     }
   }
-  auto router_logits = gate_(input);
-  auto output = forward_expert(
-      input, router_logits, shared_output, input_params, use_mega_moe);
+  if (!router_logits.defined()) {
+    router_logits = gate_(input);
+  }
+  auto output = forward_expert_impl(
+      input,
+      router_logits,
+      shared_output,
+      input_params,
+      use_mega_moe,
+      shared_overlap_ != nullptr ? &shared_execution : nullptr);
 
   if (need_slice) {
     const int64_t dp_rank = parallel_args_.dp_local_process_group_->rank();
@@ -2614,7 +2784,8 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts_ep2(
     const torch::Tensor& hidden_states,
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
-    const ModelInputParams& input_params) {
+    const ModelInputParams& input_params,
+    SharedExpertExecution* shared_execution) {
   const auto hidden_states_shape = hidden_states.sizes();
   auto input_2d =
       hidden_states.reshape({-1, hidden_states.size(-1)}).contiguous();
@@ -2659,6 +2830,12 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts_ep2(
     global_bs = 0;
   }
 
+  if (shared_execution != nullptr && (dispatch_ffn_combine_prepared_ ||
+                                      dispatch_gmm_combine_decode_prepared_)) {
+    // Opaque fused dispatch/compute/combine has no internal stage events.
+    enqueue_shared_expert_activation(*shared_execution);
+    enqueue_shared_expert_output(hidden_states, *shared_execution);
+  }
   if (dispatch_ffn_combine_prepared_) {
     return forward_with_dispatch_ffn_combine(input_2d,
                                              weights_2d,
@@ -2704,6 +2881,10 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts_ep2(
       xllm::kernel::moe_distribute_dispatch_v2(dispatch_params);
   (void)dynamic_scale;
   record_eplb_dispatch_expert_load(group_list, input_params);
+
+  if (shared_execution != nullptr) {
+    enqueue_shared_expert_activation(*shared_execution);
+  }
 
   torch::Tensor gemm1_out;
   torch::Tensor gemm2_out;
@@ -2815,6 +2996,10 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts_ep2(
     }
   }
 
+  if (shared_execution != nullptr) {
+    enqueue_shared_expert_output(hidden_states, *shared_execution);
+  }
+
   xllm::kernel::MoeDistributeCombineV2Params combine_params;
   combine_params.expand_x = gemm2_out;
   combine_params.expert_ids = ids_2d;
@@ -2845,6 +3030,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
     const ModelInputParams& input_params) {
+  npu::SuperKernelScopePause super_kernel_pause(skip_moe_super_kernel());
   torch::Tensor input = hidden_states;
   torch::Tensor selected_topk_weights = topk_weights;
   torch::Tensor selected_topk_ids = topk_ids;
@@ -2854,12 +3040,16 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       can_use_ep2_dispatch_combine(input_params, input);
   if (use_ep2_dispatch_combine) {
     std::optional<torch::Tensor> shared_output = std::nullopt;
-    if (n_shared_experts_ > 0) {
+    SharedExpertExecution shared_execution;
+    if (shared_overlap_ != nullptr) {
+      enqueue_shared_expert_gate_up(input, shared_execution);
+    } else if (n_shared_experts_ > 0) {
       shared_output = shared_experts_(input);
       if (should_apply_shared_expert_gate(shared_expert_gate_,
                                           is_deepseek_v4_,
                                           shared_expert_gate_is_loaded_)) {
-        auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
+        auto gate = torch::sigmoid(
+            linear_with_weight_nz(input, shared_expert_gate_->weight));
         if (shared_output.has_value()) {
           torch::Tensor res = gate * shared_output.value();
           shared_output = res;
@@ -2867,7 +3057,15 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       }
     }
     auto output = forward_with_selected_experts_ep2(
-        input, selected_topk_weights, selected_topk_ids, input_params);
+        input,
+        selected_topk_weights,
+        selected_topk_ids,
+        input_params,
+        shared_overlap_ != nullptr ? &shared_execution : nullptr);
+    if (shared_overlap_ != nullptr) {
+      wait_shared_expert_output(shared_execution);
+      shared_output = shared_execution.output;
+    }
     if (shared_output.has_value()) {
       output = output + shared_output.value();
     }
@@ -2904,12 +3102,16 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       std::make_pair(weights_2d.to(input.dtype()), ids_2d.to(torch::kInt32));
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
-  if (n_shared_experts_ > 0) {
+  SharedExpertExecution shared_execution;
+  if (shared_overlap_ != nullptr) {
+    enqueue_shared_expert_gate_up(input, shared_execution);
+  } else if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
     if (should_apply_shared_expert_gate(shared_expert_gate_,
                                         is_deepseek_v4_,
                                         shared_expert_gate_is_loaded_)) {
-      torch::Tensor gate = torch::sigmoid(shared_expert_gate_->forward(input));
+      torch::Tensor gate = torch::sigmoid(
+          linear_with_weight_nz(input, shared_expert_gate_->weight));
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
         shared_output = res;
@@ -2920,8 +3122,13 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   std::vector<int64_t> router_shape = input.sizes().vec();
   router_shape.back() = num_total_experts_;
   torch::Tensor router_logits = torch::empty(router_shape, input.options());
-  torch::Tensor output =
-      forward_expert(input, router_logits, shared_output, input_params, false);
+  torch::Tensor output = forward_expert_impl(
+      input,
+      router_logits,
+      shared_output,
+      input_params,
+      /*use_mega_moe=*/false,
+      shared_overlap_ != nullptr ? &shared_execution : nullptr);
   preselected_experts_ = std::nullopt;
 
   if (need_slice) {

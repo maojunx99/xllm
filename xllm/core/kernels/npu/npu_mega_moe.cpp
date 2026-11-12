@@ -564,6 +564,52 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
     return std::make_tuple(y, expert_token_nums);
   }
 
+  // aclnnMegaMoe ABI (ops-transformer mc2/mega_moe op_api): after xActiveMask
+  // follow scalesOptional, six shared-expert tensor lists, and maskBuffer;
+  // sharedExpertQuantOutDtype sits between dispatchQuantOutDtype and
+  // combineQuantMode; the activation clamp is an aclFloatArray; topoType,
+  // rankNumPerServer, topkWeightsType, combineCommMode precede the outputs.
+  // std::optional<TensorList> has no ConvertType overload, so build the
+  // aclTensorList handles explicitly instead of passing the optional struct
+  // by value into a pointer slot.
+  const auto to_acl_tensor_list =
+      [](const std::optional<torch::TensorList>& tensors) -> aclTensorList* {
+    if (!tensors.has_value() || tensors->empty()) {
+      return nullptr;
+    }
+    std::vector<aclTensor*> views;
+    views.reserve(tensors->size());
+    for (const auto& tensor : *tensors) {
+      views.push_back(aclnn::detail::convert_type(tensor));
+    }
+    return create_acl_tensor_list(views);
+  };
+  aclTensorList* weight_scales1_acl = to_acl_tensor_list(weight_scales1);
+  aclTensorList* weight_scales2_acl = to_acl_tensor_list(weight_scales2);
+  aclTensorList* bias1_acl = to_acl_tensor_list(bias1);
+  aclTensorList* bias2_acl = to_acl_tensor_list(bias2);
+  // aclFloatArray is opaque: create it through the aclnn API and destroy it
+  // after the EXEC block (Release() has no aclFloatArray* overload).
+  using AclCreateFloatArrayFn = aclFloatArray* (*)(const float*, uint64_t);
+  using AclDestroyFloatArrayFn = aclnnStatus (*)(const aclFloatArray*);
+  static const auto acl_create_float_array =
+      reinterpret_cast<AclCreateFloatArrayFn>(
+          aclnn::detail::get_op_api_func_addr("aclCreateFloatArray"));
+  static const auto acl_destroy_float_array =
+      reinterpret_cast<AclDestroyFloatArrayFn>(
+          aclnn::detail::get_op_api_func_addr("aclDestroyFloatArray"));
+  CHECK(acl_create_float_array != nullptr)
+      << "aclCreateFloatArray is not available in libopapi.";
+  aclFloatArray* activation_params = acl_create_float_array(&activation_clamp, 1);
+  CHECK(activation_params != nullptr)
+      << "aclCreateFloatArray returned nullptr.";
+  // ConvertTypes takes non-const lvalue references, so the optional pointer
+  // slots and fixed int64 arguments need named lvalues instead of nullptr
+  // literals and static_cast temporaries.
+  std::nullptr_t no_optional = nullptr;
+  int64_t shared_expert_quant_out_dtype_arg = 0;
+  int64_t topk_weights_type_arg = 0;
+  int64_t combine_comm_mode_arg = 0;
   EXEC_NPU_CMD(aclnnMegaMoe,
                context,
                x,
@@ -571,33 +617,40 @@ std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
                topk_weights,
                weight1,
                weight2,
-               weight_scales1,  // weight_scales1 (nullptr on A16W16)
-               weight_scales2,  // weight_scales2 (nullptr on A16W16)
-               bias1,           // bias1 (nullptr on A16W16)
-               bias2,           // bias2 (nullptr on A16W16)
+               weight_scales1_acl,  // weight_scales1 (nullptr on A16W16)
+               weight_scales2_acl,  // weight_scales2 (nullptr on A16W16)
+               bias1_acl,           // bias1 (nullptr on A16W16)
+               bias2_acl,           // bias2 (nullptr on A16W16)
                x_active_mask,
-               //    no_tensor_list,    // shared_weight1 (no shared expert)
-               //    no_tensor_list,    // shared_weight2
-               //    no_tensor_list,    // shared_weight_scales1
-               //    no_tensor_list,    // shared_weight_scales2
-               //    no_tensor_list,    // shared_bias1
-               //    no_tensor_list,    // shared_bias2
+               no_optional,  // scalesOptional (no dispatch activation scales)
+               no_optional,  // sharedWeight1 (no shared expert)
+               no_optional,  // sharedWeight2
+               no_optional,  // sharedWeightScales1
+               no_optional,  // sharedWeightScales2
+               no_optional,  // sharedBias1
+               no_optional,  // sharedBias2
+               no_optional,  // maskBuffer
                moe_expert_num,
                ep_world_size,
                ccl_buffer_size,
                max_recv_token_num,
                dispatch_quant_mode,
                resolved_dispatch_quant_out_dtype,
+               shared_expert_quant_out_dtype_arg,
                combine_quant_mode,
                comm_alg_ptr,
                num_max_tokens_per_rank,
                activation_ptr,
-               activation_clamp,
-               //    topo_type,
-               //    rank_num_per_server,
-               //    topkWeightsType,
+               activation_params,
+               topo_type,
+               rank_num_per_server,
+               topk_weights_type_arg,
+               combine_comm_mode_arg,
                y,
                expert_token_nums);
+  if (acl_destroy_float_array != nullptr) {
+    acl_destroy_float_array(activation_params);
+  }
 
   return std::make_tuple(y, expert_token_nums);
 }

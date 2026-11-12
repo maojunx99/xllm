@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <torch/torch.h>
+#include <torch_npu/csrc/core/npu/NPUEvent.h>
 
 #include <chrono>
 #include <cstdint>
@@ -38,6 +39,7 @@ limitations under the License.
 #include "layers/common/fused_moe_base.h"
 #include "layers/common/linear.h"
 #include "layers/npu_torch/deepseek_v4_eplb_utils.h"
+#include "platform/stream.h"
 
 namespace xllm {
 namespace layer {
@@ -98,6 +100,36 @@ class FusedMoEImpl : public torch::nn::Module {
   }
 
  private:
+  struct SharedExpertExecution {
+    torch::Tensor gate_up;
+    torch::Tensor activation;
+    torch::Tensor output;
+    c10_npu::NPUEvent router_ready;
+    c10_npu::NPUEvent activation_ready;
+    c10_npu::NPUEvent combine_ready;
+    c10_npu::NPUEvent output_ready;
+  };
+
+  struct SharedExpertOverlapState {
+    Stream stream;
+  };
+
+  std::unique_ptr<SharedExpertOverlapState> shared_overlap_;
+
+  torch::Tensor forward_expert_impl(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& router_logits,
+      const std::optional<torch::Tensor>& shared_output,
+      const ModelInputParams& input_params,
+      bool use_mega_moe,
+      SharedExpertExecution* shared_execution);
+  void wait_shared_expert_output(SharedExpertExecution& execution);
+  void enqueue_shared_expert_gate_up(const torch::Tensor& input,
+                                     SharedExpertExecution& execution);
+  void enqueue_shared_expert_activation(SharedExpertExecution& execution);
+  void enqueue_shared_expert_output(const torch::Tensor& input,
+                                    SharedExpertExecution& execution);
+
   // struct to store the selected expert info
   struct SelectedExpertInfo {
     torch::Tensor reduce_weight;
@@ -126,7 +158,8 @@ class FusedMoEImpl : public torch::nn::Module {
   // non-uniform or empty DP shards, and output shape restoration.
   torch::Tensor forward_mega_moe(const torch::Tensor& hidden_states,
                                  const torch::Tensor& router_logits,
-                                 const ModelInputParams& input_params);
+                                 const ModelInputParams& input_params,
+                                 SharedExpertExecution* shared_execution);
 
   // Returns true when the mega_moe fused kernel should be used instead of
   // the allgather + dispatch/combine path.
@@ -147,6 +180,7 @@ class FusedMoEImpl : public torch::nn::Module {
   bool skip_gate_load_;
   bool is_deepseek_v4_ = false;
   bool shared_expert_gate_is_loaded_ = false;
+  bool enable_moe_finalize_routing_ = false;
   int64_t renormalize_;
   double swiglu_limit_ = 0.0;
   std::string hidden_act_;
@@ -249,7 +283,8 @@ class FusedMoEImpl : public torch::nn::Module {
       const torch::Tensor& hidden_states,
       const torch::Tensor& topk_weights,
       const torch::Tensor& topk_ids,
-      const ModelInputParams& input_params);
+      const ModelInputParams& input_params,
+      SharedExpertExecution* shared_execution);
   const std::string& get_mc2_group_name();
   const std::string& get_moe_ep_process_group_name();
 

@@ -212,7 +212,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
 
   std::vector<Block> allocated = block_allocator()->allocate(1);
   if (allocated.empty()) {
-    if (blocks->empty()) {
+    if (blocks->empty() || blocks->back().is_shared()) {
       VLOG(1)
           << "LinearStateBlockManager::allocate_prefill: no blocks to allocate";
       return std::nullopt;
@@ -258,6 +258,15 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
   if (blocks->size() == 2) {
     if (completed_checkpoint) {
       if (options_.preserve_decode_checkpoint()) {
+        const size_t write_index = options_.enable_schedule_overlap() ? 1 : 0;
+        if ((*blocks)[write_index].is_shared()) {
+          std::vector<Block> allocated = block_allocator()->allocate(1);
+          if (allocated.empty()) {
+            return std::nullopt;
+          }
+          blocks->erase(blocks->begin() + write_index);
+          return allocated;
+        }
         // Host cache is on. collect_offload_pairs runs after allocate and
         // moves the front slot. Overlap keeps the n-2 result on the front
         // block, so that slot is already the one to save. Overlap off writes
@@ -270,6 +279,16 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
       }
       blocks->erase(blocks->begin());
     } else {
+      if (blocks->front().is_shared()) {
+        // A published checkpoint or another sequence still owns the old read
+        // slot. Keep that state immutable instead of rotating it into a write.
+        std::vector<Block> allocated = block_allocator()->allocate(1);
+        if (allocated.empty()) {
+          return std::nullopt;
+        }
+        blocks->erase(blocks->begin());
+        return allocated;
+      }
       // The previous decode step has not yet confirmed a checkpoint. Keep
       // both slots alive and alternate their roles so the next out-of-place
       // step reads the slot written by the preceding step. This is also
@@ -281,6 +300,15 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_decode(
   }
 
   if (blocks->empty()) {
+    std::vector<Block> allocated = block_allocator()->allocate(1);
+    return allocated.empty()
+               ? std::nullopt
+               : std::optional<std::vector<Block>>(std::move(allocated));
+  }
+
+  if (blocks->back().is_shared()) {
+    // A restored checkpoint may be the only slot. Out-of-place decode must
+    // protect it even when the next step does not cross a checkpoint boundary.
     std::vector<Block> allocated = block_allocator()->allocate(1);
     return allocated.empty()
                ? std::nullopt

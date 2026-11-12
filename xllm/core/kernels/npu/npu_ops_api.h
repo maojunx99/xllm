@@ -239,6 +239,11 @@ torch::Tensor apply_npu_moe_token_unpermute(
     bool padded_mode,
     c10::OptionalIntArrayRef restore_shape);
 
+torch::Tensor apply_npu_moe_finalize_routing(
+    const torch::Tensor& expanded_tokens,
+    const torch::Tensor& probabilities,
+    const torch::Tensor& expanded_row_ids);
+
 std::tuple<torch::Tensor, torch::Tensor> apply_moe_gating_topk_softmax(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& finished,

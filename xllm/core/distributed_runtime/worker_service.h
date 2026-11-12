@@ -157,6 +157,11 @@ class WorkerService : public proto::DistributeWorker {
                     proto::Status* resp,
                     ::google::protobuf::Closure* done) override;
 
+  void StaticKernelControl(::google::protobuf::RpcController* controller,
+                           const proto::StaticKernelControlRequest* req,
+                           proto::StaticKernelControlResponse* resp,
+                           ::google::protobuf::Closure* done) override;
+
   void StopProfile(::google::protobuf::RpcController* controller,
                    const proto::Empty* req,
                    proto::Status* resp,

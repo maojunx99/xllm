@@ -42,6 +42,10 @@ class ExecutionConfig final {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
         {"enable_graph",
+         "enable_static_kernel",
+         "enable_super_kernel",
+         "super_kernel_auto_op_parallel",
+         "static_kernel_cache_dir",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -61,6 +65,15 @@ class ExecutionConfig final {
   }
 
   PROPERTY(bool, enable_graph) = false;
+
+  PROPERTY(bool, enable_static_kernel) = false;
+
+  PROPERTY(bool, enable_super_kernel) = false;
+
+  PROPERTY(bool, super_kernel_auto_op_parallel) = false;
+
+  // Empty selects $XDG_CACHE_HOME/xllm/static_kernel or ~/.cache/xllm/...
+  PROPERTY(std::string, static_kernel_cache_dir) = "";
 
   PROPERTY(bool, disable_graph_warmup) = false;
 

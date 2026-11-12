@@ -27,6 +27,8 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/platform/npu/static_kernel_manager.h"
+#include "core/platform/npu/super_kernel.h"
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/framework/OpCommand.h>
 #else
@@ -470,6 +472,9 @@ bool AclGraph::capture(CausalLM* model,
     graph_params->graph.expanded_tiling_data =
         graph_paged_attention_tiling_data_;
   }
+  graph_task_context_ = std::make_shared<AclGraphTaskUpdateContext>();
+  graph_task_context_->begin_capture();
+  graph_params->graph.acl_graph_task_update_context = graph_task_context_;
   prepare_model_graph_metadata(
       model,
       persistent_param_.persistent_positions(num_tokens_),
@@ -483,11 +488,6 @@ bool AclGraph::capture(CausalLM* model,
     update_spec_verify_attention_tiling(graph_params.value());
   }
 
-  if (model->is_hybrid_linear_attention()) {
-    graph_task_context_ = std::make_shared<AclGraphTaskUpdateContext>();
-    graph_task_context_->begin_capture();
-    graph_params->graph.acl_graph_task_update_context = graph_task_context_;
-  }
   // Synchronize stream to ensure all data is copied to graph persistent buffers
   aclrtSynchronizeStream(stream);
 
@@ -520,11 +520,18 @@ bool AclGraph::capture(CausalLM* model,
     // Reuse one pool per graph slot so bucket captures can share allocator
     // storage while the double-buffer slots remain independent.
     bool capture_started = false;
+    bool super_kernel_scope_started = false;
+    const bool enable_super_kernel =
+        ExecutionConfig::get_instance().enable_super_kernel();
     try {
       graph_.capture_begin(
           graph_pool,
           aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
       capture_started = true;
+      if (enable_super_kernel) {
+        super_kernel_scope_begin();
+        super_kernel_scope_started = true;
+      }
       // Execute forward pass - NPUGraph mempool manages temporary tensors
       auto forward_result =
           model->forward({persistent_param_.persistent_tokens(num_tokens_)},
@@ -538,9 +545,26 @@ bool AclGraph::capture(CausalLM* model,
         persistent_param_.set_aux_hidden_states(
             forward_result.aux_hidden_states);
       }
+      if (super_kernel_scope_started) {
+        super_kernel_scope_end();
+        super_kernel_scope_started = false;
+      }
       graph_.capture_end();
       capture_started = false;
+      if (enable_super_kernel) {
+        optimize_super_kernel(
+            graph_,
+            ExecutionConfig::get_instance().super_kernel_auto_op_parallel());
+      }
     } catch (...) {
+      if (super_kernel_scope_started) {
+        try {
+          super_kernel_scope_end();
+        } catch (const std::exception& cleanup_error) {
+          LOG(ERROR) << "SuperKernel scope cleanup failed: "
+                     << cleanup_error.what();
+        }
+      }
       if (capture_started) {
         try {
           graph_.capture_end();
@@ -590,12 +614,14 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params,
   auto& causal_conv1d_tasks = graph_task_context_->causal_conv1d_tasks;
   auto& fused_infer_attention_tasks =
       graph_task_context_->fused_infer_attention_tasks;
+  auto& paged_attention_tasks = graph_task_context_->paged_attention_tasks;
 
   const bool has_causal_conv1d_tasks =
       update_causal_conv1d_tasks && !causal_conv1d_tasks.empty();
   const bool has_fused_infer_attention_tasks =
       !fused_infer_attention_tasks.empty();
-  if (!has_causal_conv1d_tasks && !has_fused_infer_attention_tasks) {
+  if (!has_causal_conv1d_tasks && !has_fused_infer_attention_tasks &&
+      paged_attention_tasks.empty()) {
     return false;
   }
 
@@ -711,15 +737,44 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params,
         }
       };
 
+  auto update_paged_attention_task = [&](PagedAttentionGraphTask& task) {
+    CHECK_LE(params.attention.host.kv_seq_lens.size(),
+             static_cast<size_t>(task.batch_size));
+    std::vector<int32_t> lengths(task.batch_size, 1);
+    std::copy(params.attention.host.kv_seq_lens.begin(),
+              params.attention.host.kv_seq_lens.end(),
+              lengths.begin());
+    task.operation->prepare(lengths,
+                            graph_task_context_->paged_attention_workspace);
+    c10_npu::graph_task_update_begin(update_stream, task.handle);
+    task.operation->execute();
+    c10_npu::graph_task_update_end(update_stream);
+    task.event->record(update_stream);
+  };
+
   size_t causal_conv1d_index =
       update_causal_conv1d_tasks ? 0 : causal_conv1d_tasks.size();
   size_t fused_infer_attention_index = 0;
+  size_t paged_attention_index = 0;
   while (causal_conv1d_index < causal_conv1d_tasks.size() ||
-         fused_infer_attention_index < fused_infer_attention_tasks.size()) {
+         fused_infer_attention_index < fused_infer_attention_tasks.size() ||
+         paged_attention_index < paged_attention_tasks.size()) {
     const bool causal_conv1d_available =
         causal_conv1d_index < causal_conv1d_tasks.size();
     const bool fused_infer_attention_available =
         fused_infer_attention_index < fused_infer_attention_tasks.size();
+    if (paged_attention_index < paged_attention_tasks.size() &&
+        (!causal_conv1d_available ||
+         paged_attention_tasks[paged_attention_index].capture_order <
+             causal_conv1d_tasks[causal_conv1d_index].capture_order) &&
+        (!fused_infer_attention_available ||
+         paged_attention_tasks[paged_attention_index].capture_order <
+             fused_infer_attention_tasks[fused_infer_attention_index]
+                 .capture_order)) {
+      update_paged_attention_task(
+          paged_attention_tasks[paged_attention_index++]);
+      continue;
+    }
     if (causal_conv1d_available && fused_infer_attention_available) {
       CHECK_NE(causal_conv1d_tasks[causal_conv1d_index].capture_order,
                fused_infer_attention_tasks[fused_infer_attention_index]
@@ -866,6 +921,11 @@ void AclGraph::update_spec_verify_attention_tiling(
       spec_verify_kv_split_core_count_);
 }
 
+bool AclGraph::has_paged_attention_graph_tasks() const {
+  return graph_task_context_ != nullptr &&
+         !graph_task_context_->paged_attention_tasks.empty();
+}
+
 bool AclGraph::has_fused_infer_attention_graph_tasks() const {
   return graph_task_context_ != nullptr &&
          !graph_task_context_->fused_infer_attention_tasks.empty();
@@ -883,12 +943,12 @@ ModelOutput AclGraph::replay(CausalLM* model,
       << actual_num_tokens;
 
   // Update persistent parameters with new input data
-  // Note: tiling_data is updated in update() if needed - for hybrid models
-  // (e.g., qwen3_next with mixed GDN/attention layers), tiling should only
-  // be updated when Full Attention layers are involved, which is determined
-  // by k_cache being valid and non-empty
+  // PA/FIA task updates regenerate their own tiling and launch dimensions.
+  // Legacy graph paths still refresh their external tiling in update().
   const bool needs_graph_metadata = model->requires_graph_forward_metadata() ||
-                                    model->is_hybrid_linear_attention();
+                                    model->is_hybrid_linear_attention() ||
+                                    has_paged_attention_graph_tasks() ||
+                                    has_fused_infer_attention_graph_tasks();
   const bool replay_inputs_prepared =
       replay_inputs_prepared_.exchange(false, std::memory_order_acq_rel);
   const bool can_use_prepared_inputs =
@@ -934,7 +994,8 @@ ModelOutput AclGraph::replay(CausalLM* model,
                                  /*skip_token_update=*/false,
                                  /*for_capture=*/false,
                                  /*update_paged_attention_plan=*/
-                                 !has_fused_infer_attention_graph_tasks());
+                                 !has_fused_infer_attention_graph_tasks() &&
+                                     !has_paged_attention_graph_tasks());
     if (needs_graph_metadata) {
       CHECK(graph_params.has_value())
           << "ACL graph replay requires persistent params for graph metadata";
@@ -968,7 +1029,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
   CHECK(!static_graph_tasks_prepared || use_static_graph_tasks)
       << "prepared static graph tasks do not match the replay signature";
   graph_.replay();
-  if (model->is_hybrid_linear_attention()) {
+  if (model->is_hybrid_linear_attention() ||
+      has_paged_attention_graph_tasks() ||
+      has_fused_infer_attention_graph_tasks()) {
     CHECK(graph_params.has_value())
         << "update() should return ModelInputParams for graph task update";
     const bool causal_conv1d_tasks_prepared =
@@ -1018,7 +1081,8 @@ void AclGraph::prepare_replay_inputs(const torch::Tensor& tokens,
                            /*skip_token_update=*/true,
                            /*for_capture=*/false,
                            /*update_paged_attention_plan=*/
-                           !has_fused_infer_attention_graph_tasks());
+                           !has_fused_infer_attention_graph_tasks() &&
+                               !has_paged_attention_graph_tasks());
   replay_inputs_prepared_.store(true, std::memory_order_release);
 }
 
@@ -1138,6 +1202,9 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     eager_params.attn_metadata.reset();
     return forward_eager(model_, tokens, positions, kv_caches, eager_params);
   };
+  if (npu::StaticKernelManager::get_instance().is_collecting()) {
+    return run_eager();
+  }
   // no mirco batch in decode phase
   const torch::Tensor& tokens_tensor = tokens;
   const torch::Tensor& positions_tensor = positions;

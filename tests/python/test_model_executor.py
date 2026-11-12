@@ -110,6 +110,36 @@ class StubAttentionBackend(AttentionBackend):
         return 1
 
 
+@pytest.mark.parametrize("runner_kind", ["graph", "inductor", "eager"])
+@pytest.mark.parametrize("force_eager", [False, True])
+def test_static_calibration_uses_eager_before_graph_capture(runner_kind: str, force_eager: bool) -> None:
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor._kv_bound = True
+    executor.layerwise_split_size = 1
+    executor._execution_metadata_builders = []
+    executor._is_spec_draft = False
+    executor.model = SimpleNamespace()
+    executor._restore_engram_history = None
+    executor.attention_backend = object()
+    executor.eager_runner = MagicMock()
+    executor.eager_runner.execute.return_value = torch.ones(1)
+    executor.decode_graph_runner = MagicMock() if runner_kind == "graph" else None
+    executor.inductor_runner = MagicMock() if runner_kind == "inductor" else None
+    compiled_runner = executor.decode_graph_runner or executor.inductor_runner
+    if compiled_runner is not None:
+        compiled_runner.can_execute.return_value = True
+        compiled_runner.execute.return_value = torch.zeros(1)
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
+    result = executor.execute(torch.zeros(1), torch.zeros(1), metadata, force_eager=force_eager)
+    use_eager = force_eager or runner_kind == "eager"
+    assert torch.equal(result, torch.ones(1) if use_eager else torch.zeros(1))
+    assert executor.eager_runner.execute.call_count == int(use_eager)
+    if compiled_runner is not None and force_eager:
+        compiled_runner.can_execute.assert_not_called()
+        compiled_runner.warmup.assert_not_called()
+        compiled_runner.execute.assert_not_called()
+
+
 class _PagedStubAttentionBackend(StubAttentionBackend):
     @property
     def page_size(self) -> int:
@@ -222,6 +252,8 @@ def test_v41_executor_preserves_csa2_dispatch_after_main_integration(
             enable_mega_moe_token_mask=False,
             is_spec_draft=False,
             draft_query_width=1,
+            enable_super_kernel=False,
+            super_kernel_auto_op_parallel=False,
         )
         executor.decode_graph_runner.bind_execution_metadata_builders.assert_called_once_with(())
 
@@ -1074,6 +1106,38 @@ class TestCreateAttentionBackend:
 
 
 class TestModelExecutorConstruction:
+    @pytest.mark.parametrize(
+        ("static_kernel", "backend", "valid"),
+        [(True, "aclgraph", True), (False, "aclgraph", False), (True, "off", False), (False, "off", False)],
+    )
+    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
+    @patch("xllm.python.model_executor.executor._create_attention_backend")
+    def test_super_kernel_configuration_reaches_acl_runner(
+        self,
+        mock_create: MagicMock,
+        mock_runner: MagicMock,
+        static_kernel: bool,
+        backend: str,
+        valid: bool,
+    ) -> None:
+        mock_create.return_value = StubAttentionBackend()
+        config = {
+            "max_position_embeddings": 128,
+            "python_graph_backend": backend,
+            "enable_static_kernel": static_kernel,
+            "enable_super_kernel": True,
+            "super_kernel_auto_op_parallel": True,
+        }
+        model = _FakeModel(num_layers=1)
+        if valid:
+            ModelExecutor(model, config, max_seqs_per_batch=4)
+            assert mock_runner.call_args.kwargs["enable_super_kernel"] is True
+            assert mock_runner.call_args.kwargs["super_kernel_auto_op_parallel"] is True
+        else:
+            with pytest.raises(ValueError, match="SuperKernel requires"):
+                ModelExecutor(model, config, max_seqs_per_batch=4)
+            mock_runner.assert_not_called()
+
     @pytest.mark.parametrize("kv_page_size", [64, 128])
     @pytest.mark.parametrize("supported", [False, True])
     @patch(
@@ -1463,6 +1527,8 @@ class TestModelExecutorConstruction:
             enable_mega_moe_token_mask=False,
             is_spec_draft=is_spec_draft,
             draft_query_width=1,
+            enable_super_kernel=False,
+            super_kernel_auto_op_parallel=False,
         )
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
@@ -1666,6 +1732,8 @@ class TestModelExecutorConstruction:
             enable_mega_moe_token_mask=True,
             is_spec_draft=False,
             draft_query_width=1,
+            enable_super_kernel=False,
+            super_kernel_auto_op_parallel=False,
         )
 
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")

@@ -140,6 +140,8 @@ class ProfileManager {
   void profile_step_time(bool if_dump_to_file);
 
  private:
+  void prepare_static_kernels();
+
   void dump_step_time_profile_to_file(
       const std::vector<std::pair<int32_t, double>>& time_profiling_data,
       bool is_prefill);

@@ -32,6 +32,11 @@ limitations under the License.
 
 namespace xllm {
 
+folly::SemiFuture<std::string> WorkerClient::static_kernel_control_async(
+    const std::string& command) {
+  return worker_->static_kernel_control_async(command);
+}
+
 bool WorkerClient::init_model(const std::string& model_weights_path,
                               int32_t random_seed,
                               MasterStatus master_status) {

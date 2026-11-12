@@ -25,12 +25,17 @@ limitations under the License.
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <nlohmann/json.hpp>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
@@ -128,6 +133,9 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
       options.enable_profile_kv_blocks(), false /*is_prefill*/);
   speculative_validate_time_predictor_ = std::make_unique<TimePredictor>(
       options.enable_profile_kv_blocks(), false /*is_prefill*/);
+  if (::xllm::ExecutionConfig::get_instance().enable_static_kernel()) {
+    prepare_static_kernels();
+  }
   if (options.enable_profile_step_time()) {
     LOG(INFO) << "Starting profiliing step time.";
     profile_step_time(false);
@@ -1240,6 +1248,126 @@ void ProfileManager::warmup_for_eager() {
                                              /*is_graph_warmup=*/true);
   LOG(INFO) << "Eager warmup completed: tokens=" << prefill_tokens
             << ", latency=" << prefill_latency << " ms";
+}
+
+void ProfileManager::prepare_static_kernels() {
+  CHECK(Platform::is_npu()) << "Static kernels require an NPU build";
+  const auto& config = ::xllm::ExecutionConfig::get_instance();
+  nlohmann::ordered_json startup = nlohmann::ordered_json::object();
+  config.append_config_json(startup);
+  KernelConfig::get_instance().append_config_json(startup);
+  KVCacheConfig::get_instance().append_config_json(startup);
+  LoadConfig::get_instance().append_config_json(startup);
+  ModelConfig::get_instance().append_config_json(startup);
+  SchedulerConfig::get_instance().append_config_json(startup);
+  SpeculativeConfig::get_instance().append_config_json(startup);
+  startup["decode_batches"] = decode_graph_warmup_plan_.batch_sizes;
+  const auto control = [this, &config, &startup](const std::string& action,
+                                                 const nlohmann::json& extra =
+                                                     nlohmann::json::object()) {
+    nlohmann::json command = {{"action", action},
+                              {"cache_dir", config.static_kernel_cache_dir()},
+                              {"super_kernel", config.enable_super_kernel()},
+                              {"super_kernel_auto_op_parallel",
+                               config.super_kernel_auto_op_parallel()},
+                              {"startup_context", startup}};
+    command.update(extra);
+    const auto reports = engine_->static_kernel_control(command.dump());
+    for (const std::string& report : reports) {
+      LOG(INFO) << "Static kernel startup: " << report;
+    }
+    return reports;
+  };
+  const auto probes = control("probe");
+  bool all_cached = !probes.empty();
+  std::unordered_map<std::string, std::string> group_packages;
+  auto compilation_groups = nlohmann::json::object();
+  for (const std::string& report : probes) {
+    const auto parsed = nlohmann::json::parse(report);
+    const std::string group_key =
+        parsed.at("compilation_group").get<std::string>();
+    const std::string session = parsed.at("session").get<std::string>();
+    if (!compilation_groups.contains(group_key)) {
+      compilation_groups[group_key] = {{"leader_session", session},
+                                       {"sessions", nlohmann::json::array()}};
+    }
+    auto& sessions = compilation_groups[group_key]["sessions"];
+    if (std::find(sessions.begin(), sessions.end(), session) ==
+        sessions.end()) {
+      sessions.emplace_back(session);
+    }
+    const auto& probe = parsed.at("result");
+    if (!probe.at("startup_cache_hit").get<bool>()) {
+      all_cached = false;
+      continue;
+    }
+    const std::string package =
+        probe.at("result").at("cache_key").get<std::string>();
+    const auto [entry, inserted] = group_packages.emplace(group_key, package);
+    if (!inserted && entry->second != package) {
+      all_cached = false;
+    }
+  }
+  if (all_cached) {
+    LOG(INFO) << "Static kernel startup cache hit on every worker; skipping "
+                 "collection.";
+    control("load");
+    return;
+  }
+  LOG(INFO)
+      << "Static kernel startup cache miss; collecting operator arguments.";
+  control("begin");
+  if (options_.instance_role() != InstanceRole::DECODE) {
+    warmup_for_eager();
+  }
+  if (options_.instance_role() != InstanceRole::PREFILL) {
+    int32_t max_batch_size = options_.max_seqs_per_batch();
+    const int32_t concurrency =
+        ::xllm::ServiceConfig::get_instance().max_concurrent_requests();
+    if (concurrency > 0) {
+      max_batch_size = std::min(max_batch_size, concurrency);
+    }
+    const int32_t sequence_length =
+        warmup_decode_seq_len(config.enable_fia_decode(),
+                              engine_->model_args().max_position_embeddings());
+    max_batch_size = std::min(
+        max_batch_size,
+        measure_graph_decode_capacity(max_batch_size, sequence_length));
+    const auto plan =
+        build_decode_graph_warmup_plan(engine_->decode_graph_warmup_config(),
+                                       max_batch_size,
+                                       options_.dp_size());
+    // This is coverage, not a runtime shape restriction. Unseen shapes retain
+    // normal CANN dispatch. Collection bypasses graph capture in each executor.
+    for (int32_t batch_size : plan.batch_sizes) {
+      run_graph_decode_request(
+          std::vector<int32_t>(batch_size, sequence_length));
+    }
+  }
+  control("end");
+  // The RPC fanout waits for all node leaders to finish. Non-leaders do not
+  // spawn a compiler. Paths are shared only within a verified cache domain.
+  const auto prepared =
+      control("prepare", {{"compilation_groups", compilation_groups}});
+  auto compiled_packages = nlohmann::json::object();
+  for (const std::string& report : prepared) {
+    const auto parsed = nlohmann::json::parse(report);
+    const auto& result = parsed.at("result");
+    if (result.is_null()) {
+      continue;
+    }
+    const std::string group_key =
+        parsed.at("compilation_group").get<std::string>();
+    CHECK(compilation_groups.contains(group_key));
+    if (compiled_packages.contains(group_key)) {
+      CHECK_EQ(compiled_packages.at(group_key).at("cache_key"),
+               result.at("cache_key"));
+    }
+    compiled_packages[group_key] = result;
+  }
+  CHECK_EQ(compiled_packages.size(), compilation_groups.size());
+  control("load", {{"compiled_packages", compiled_packages}});
+  control("publish");
 }
 
 void ProfileManager::warmup_for_graph() {

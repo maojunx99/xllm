@@ -555,6 +555,12 @@ py::dict PyCausalLM::build_config_dict(
   // target reads this to publish its capture through a persistent buffer
   // instead of returning the tuple the graph runner cannot accept.
   d["enable_graph_aux_hidden_states"] = allow_graph_aux_hidden_states;
+  d["enable_static_kernel"] =
+      ExecutionConfig::get_instance().enable_static_kernel();
+  d["enable_super_kernel"] =
+      ExecutionConfig::get_instance().enable_super_kernel();
+  d["super_kernel_auto_op_parallel"] =
+      ExecutionConfig::get_instance().super_kernel_auto_op_parallel();
   d["draft_graph_enabled"] = speculative_runtime_config.draft_graph_enabled;
   // Engram host-offload switches, forwarded as the raw JSON string; the Python
   // executor parses/validates it (xllm/python/models/engram_config.py).

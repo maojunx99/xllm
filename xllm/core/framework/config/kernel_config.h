@@ -44,12 +44,15 @@ class KernelConfig final {
          "npu_kernel_backend",
          "enable_intralayer_addnorm",
          "enable_fused_mc2",
+         "enable_weight_nz",
          "enable_interlayer_addnorm",
          "enable_split_rmsnorm_rope",
          "enable_split_rmsnorm_rope_prefill",
          "enable_aclnn_matmul",
          "enable_aclnn_swiglu",
          "enable_mega_moe",
+         "enable_shared_expert_overlap",
+         "enable_moe_finalize_routing",
          "enable_dspark_native_sas",
          "enable_flashcomm1",
          "enable_dsa_cp",
@@ -69,6 +72,8 @@ class KernelConfig final {
 
   PROPERTY(int32_t, enable_fused_mc2) = 0;
 
+  PROPERTY(bool, enable_weight_nz) = false;
+
   PROPERTY(bool, enable_interlayer_addnorm) = false;
 
   PROPERTY(bool, enable_split_rmsnorm_rope) = false;
@@ -80,6 +85,10 @@ class KernelConfig final {
   PROPERTY(bool, enable_aclnn_swiglu) = false;
 
   PROPERTY(bool, enable_mega_moe) = false;
+
+  PROPERTY(bool, enable_shared_expert_overlap) = false;
+
+  PROPERTY(bool, enable_moe_finalize_routing) = false;
 
   PROPERTY(bool, enable_dspark_native_sas) = false;
 

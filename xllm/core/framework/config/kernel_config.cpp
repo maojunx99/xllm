@@ -38,6 +38,11 @@ DEFINE_int32(enable_fused_mc2,
              "MC2, positive values enable dense matmul-allreduce, 1 uses "
              "DispatchFFNCombine for MoE, 2 uses DispatchGmmCombineDecode for "
              "MoE.");
+DEFINE_bool(enable_weight_nz,
+             false,
+             "Cast BF16 linear weights to FRACTAL_NZ with [K, N] layout "
+             "at load time so aclnn matmul skips the runtime transpose.");
+
 DEFINE_bool(enable_interlayer_addnorm,
             false,
             "enable fused interlayer addnorm ops.");
@@ -64,6 +69,15 @@ DEFINE_bool(enable_aclnn_swiglu,
 DEFINE_bool(enable_mega_moe,
             false,
             "enable mega_moe fused operator for MoE expert parallel.");
+
+DEFINE_bool(enable_shared_expert_overlap,
+            false,
+            "Overlap shared and routed experts on an auxiliary NPU stream.");
+
+DEFINE_bool(enable_moe_finalize_routing,
+            false,
+            "Use MoeFinalizeRoutingV2 to combine routed experts when EP > 1. "
+            "EP = 1 keeps token unpermute regardless of this option.");
 
 DEFINE_bool(enable_dspark_native_sas,
             false,
@@ -136,12 +150,15 @@ void KernelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(npu_kernel_backend);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_intralayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_fused_mc2);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_weight_nz);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_interlayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_split_rmsnorm_rope);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_split_rmsnorm_rope_prefill);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_aclnn_matmul);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mega_moe);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_shared_expert_overlap);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_moe_finalize_routing);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_cp);
@@ -158,12 +175,15 @@ void KernelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(npu_kernel_backend);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_intralayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_fused_mc2);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_weight_nz);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_interlayer_addnorm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_split_rmsnorm_rope);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_split_rmsnorm_rope_prefill);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_aclnn_matmul);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_aclnn_swiglu);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mega_moe);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_shared_expert_overlap);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_moe_finalize_routing);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_flashcomm1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_cp);
@@ -205,6 +225,10 @@ void KernelConfig::append_config_json(
       config_json, default_config, enable_aclnn_swiglu);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_mega_moe);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_shared_expert_overlap);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_moe_finalize_routing);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dspark_native_sas);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

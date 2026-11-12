@@ -15,6 +15,10 @@ limitations under the License.
 
 #include "worker_impl.h"
 
+#if defined(USE_NPU)
+#include "core/platform/npu/static_kernel_manager.h"
+#endif
+
 #include <ATen/Parallel.h>
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
@@ -38,6 +42,7 @@ limitations under the License.
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -48,6 +53,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/common/constants.h"
 #include "core/common/flash_comm1_context.h"
+#include "core/common/property_json.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
@@ -1906,6 +1912,58 @@ bool WorkerImpl::start_profile() {
   LOG(ERROR) << "Profiling is not supported on this platform.";
   return false;
 #endif
+}
+
+std::string WorkerImpl::static_kernel_control(const std::string& command) {
+  folly::Promise<std::string> promise;
+  auto future = promise.getSemiFuture();
+  // Run collection and reselection on the compute thread, with its NPU
+  // device/queue context, rather than the RPC or Worker.async thread.
+  threadpool_.schedule([this, command, promise = std::move(promise)]() mutable {
+#if defined(USE_NPU)
+    auto request = nlohmann::json::parse(command);
+    if (request.at("action") == "probe") {
+      auto& startup = request["startup_context"];
+      startup["model_path"] = options_.model_path();
+      startup["model_args"] = properties_to_json(context_.get_model_args());
+      startup["parallel_args"] =
+          properties_to_json(context_.get_parallel_args());
+      // The generated communicator name changes per launch, unlike its rank
+      // geometry. It is an opaque runtime handle, not an operator signature.
+      startup["parallel_args"].erase("dispatchAndCombinecommDomain");
+      startup["dtype"] = static_cast<int32_t>(dtype_);
+      startup["instance_role"] = options_.instance_role().to_string();
+      startup["is_spec_draft"] = is_spec_draft_;
+      std::ostringstream quant;
+      quant << context_.get_quant_args();
+      startup["quant_args"] = quant.str();
+      startup["cache_layout"] = nlohmann::json::array();
+      for (const KVCache& cache : kv_caches_) {
+        auto tensors = nlohmann::json::array();
+        for (const KVCacheTensor& entry : cache.get_cache_tensors()) {
+          auto description =
+              nlohmann::json{{"role", entry.role.to_string()},
+                             {"group_id", entry.group_id},
+                             {"sequence_scoped", entry.sequence_scoped},
+                             {"defined", entry.tensor.defined()}};
+          if (entry.tensor.defined()) {
+            description["shape"] = entry.tensor.sizes().vec();
+            description["strides"] = entry.tensor.strides().vec();
+            description["dtype"] =
+                static_cast<int32_t>(entry.tensor.scalar_type());
+          }
+          tensors.emplace_back(std::move(description));
+        }
+        startup["cache_layout"].emplace_back(std::move(tensors));
+      }
+    }
+    promise.setValue(npu::StaticKernelManager::get_instance().control(
+        request.dump(), device()));
+#else
+    LOG(FATAL) << "Static kernels require an NPU build";
+#endif
+  });
+  return std::move(future).get();
 }
 
 bool WorkerImpl::stop_profile() {

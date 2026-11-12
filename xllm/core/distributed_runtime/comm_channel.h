@@ -120,6 +120,8 @@ class CommChannel {
 
   virtual bool start_profile();
 
+  virtual std::string static_kernel_control(const std::string& command);
+
   virtual bool stop_profile();
 
  protected:

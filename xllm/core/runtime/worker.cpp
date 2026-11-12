@@ -261,6 +261,16 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
 
 bool Worker::start_profile() { return impl_->start_profile(); }
 
+folly::SemiFuture<std::string> Worker::static_kernel_control_async(
+    const std::string& command) {
+  folly::Promise<std::string> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, command, promise = std::move(promise)]() mutable {
+    promise.setValue(impl_->static_kernel_control(command));
+  });
+  return future;
+}
+
 bool Worker::stop_profile() { return impl_->stop_profile(); }
 
 folly::SemiFuture<bool> Worker::start_profile_async() {

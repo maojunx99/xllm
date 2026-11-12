@@ -13,6 +13,7 @@ cc_library(
     metrics.h
     $<$<BOOL:${USE_NPU}>:mspti_helper.h>
     options.h
+    property_json.h
     public_error.h
     rate_limiter.h
     types.h

@@ -23,6 +23,8 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
+#include "core/platform/static_kernel_ops.h"
+
 namespace xllm {
 namespace eplb {
 
@@ -97,7 +99,8 @@ inline torch::Tensor expand_decode_token_mask(
   if (tokens_per_row == 1) {
     return flat_mask;
   }
-  return flat_mask.repeat_interleave(/*repeats=*/tokens_per_row, /*dim=*/0)
+  return static_kernel::repeat_interleave(
+             flat_mask, /*repeats=*/tokens_per_row, /*dim=*/0)
       .contiguous();
 }
 

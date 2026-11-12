@@ -50,6 +50,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
+#include "core/platform/static_kernel_ops.h"
 #include "runtime/draft_model_config.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/speculative_worker_utils.h"
@@ -115,7 +116,8 @@ torch::Tensor cpu_int_vec_to_device(const std::vector<int32_t>& values,
 
 void repeat_sampling_tensor(torch::Tensor& tensor, int32_t repeats) {
   if (tensor.defined()) {
-    tensor = tensor.repeat_interleave(/*repeats=*/repeats, /*dim=*/0);
+    tensor = static_kernel::repeat_interleave(
+        tensor, /*repeats=*/repeats, /*dim=*/0);
   }
 }
 

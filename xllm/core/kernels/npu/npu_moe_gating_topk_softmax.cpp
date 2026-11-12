@@ -15,7 +15,7 @@ limitations under the License.
 
 #include <torch_npu/csrc/aten/CustomFunctions.h>
 
-#include "npu_ops_api.h"
+#include "core/kernels/npu/npu_ops_api.h"
 #include "ops_npu/npu_ops.h"
 
 namespace xllm::kernel::npu {
@@ -25,15 +25,11 @@ std::tuple<torch::Tensor, torch::Tensor> apply_moe_gating_topk_softmax(
     const std::optional<torch::Tensor>& finished,
     int k,
     bool normalize) {
-  const torch::Tensor finished_tensor =
-      finished.has_value() ? finished.value() : torch::Tensor();
-  auto [topk_weights, topk_ids, row_ids] =
-      at_npu::native::custom_ops::npu_moe_gating_top_k_softmax(
-          x, finished_tensor, k);
-  (void)row_ids;
-  if (normalize) {
-    topk_weights = topk_weights / topk_weights.sum(-1, true);
-  }
+  const int64_t renorm = normalize ? 1 : 0;
+  auto [topk_weights, topk_ids, softmax_result] =
+      at_npu::native::custom_ops::npu_moe_gating_top_k_softmax_v2(
+          x, k, finished, renorm, /*output_softmax=*/false);
+  (void)softmax_result;
   return std::make_tuple(topk_weights, topk_ids);
 }
 

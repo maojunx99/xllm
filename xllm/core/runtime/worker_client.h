@@ -57,6 +57,9 @@ class WorkerClient {
   // Start/stop online timeline profiling on the underlying worker.
   virtual folly::SemiFuture<bool> start_profile_async();
 
+  virtual folly::SemiFuture<std::string> static_kernel_control_async(
+      const std::string& command);
+
   virtual folly::SemiFuture<bool> stop_profile_async();
 
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();

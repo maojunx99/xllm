@@ -130,6 +130,35 @@ endif()
 # install xllm
 install(TARGETS xllm RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+if(USE_NPU)
+  set(XLLM_STATIC_KERNEL_INSTALL_DIR "${CMAKE_INSTALL_BINDIR}")
+  if(GENERATE_SO)
+    set(XLLM_STATIC_KERNEL_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}")
+  endif()
+  set_property(TARGET xllm APPEND PROPERTY LINK_DEPENDS
+    "${PROJECT_SOURCE_DIR}/tools/static_kernel_compile.py"
+    "${PROJECT_SOURCE_DIR}/tools/static_kernel_blacklist.json"
+    "${PROJECT_SOURCE_DIR}/scripts/logger.py")
+  add_custom_command(TARGET xllm POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${PROJECT_SOURCE_DIR}/tools/static_kernel_compile.py"
+      "$<TARGET_FILE_DIR:xllm>/static_kernel_compile.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${PROJECT_SOURCE_DIR}/tools/static_kernel_blacklist.json"
+      "$<TARGET_FILE_DIR:xllm>/static_kernel_blacklist.json"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      "$<TARGET_FILE_DIR:xllm>/scripts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${PROJECT_SOURCE_DIR}/scripts/logger.py"
+      "$<TARGET_FILE_DIR:xllm>/scripts/logger.py")
+  install(PROGRAMS "${PROJECT_SOURCE_DIR}/tools/static_kernel_compile.py"
+    DESTINATION ${XLLM_STATIC_KERNEL_INSTALL_DIR})
+  install(FILES "${PROJECT_SOURCE_DIR}/tools/static_kernel_blacklist.json"
+    DESTINATION ${XLLM_STATIC_KERNEL_INSTALL_DIR})
+  install(FILES "${PROJECT_SOURCE_DIR}/scripts/logger.py"
+    DESTINATION "${XLLM_STATIC_KERNEL_INSTALL_DIR}/scripts")
+endif()
+
 # Install all dependencies for xllm
 install(CODE [[
   file(GET_RUNTIME_DEPENDENCIES

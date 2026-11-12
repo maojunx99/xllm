@@ -451,7 +451,16 @@ service Collective {
 }
 
 // Worker receive action from master engine.
+message StaticKernelControlRequest {
+  string command = 1;
+}
+
+message StaticKernelControlResponse {
+  string result = 1;
+}
+
 service DistributeWorker {
+  rpc StaticKernelControl (StaticKernelControlRequest) returns (StaticKernelControlResponse);
   rpc Hello (Status) returns (Status);
   rpc InitModel (InitModelRequest) returns (Status);
   rpc ProcessGroupTest (Empty) returns (Status);

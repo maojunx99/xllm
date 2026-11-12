@@ -44,6 +44,14 @@ struct W8A8DynamicInput {
   torch::Tensor per_token_scale;
 };
 
+#if defined(USE_NPU)
+// Uses the existing NZ-weight switch and preserves the original ND fallback.
+torch::Tensor linear_with_weight_nz(
+    const torch::Tensor& input,
+    torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias = std::nullopt);
+#endif
+
 // Linear layer with column parallelism.
 // The linear layer is defined as Y = XA + b. A is parallelized along
 // its second dimension as A = [A_1, ..., A_p].

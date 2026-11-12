@@ -186,6 +186,13 @@ class Engine {
     return false;
   };
 
+  // Startup-only control; commands are barriers across every model worker.
+  virtual std::vector<std::string> static_kernel_control(
+      const std::string& command) {
+    LOG(FATAL) << "Static kernel control is not implemented for this engine";
+    return {};
+  }
+
   virtual bool stop_profile() {
     LOG(ERROR) << "stop_profile is not implemented for this engine!";
     return false;
