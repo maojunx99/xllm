@@ -148,6 +148,9 @@ class RemoteWorker : public WorkerClient {
 
   folly::SemiFuture<bool> start_profile_async() override;
 
+  folly::SemiFuture<std::string> static_kernel_control_async(
+      const std::string& command) override;
+
   folly::SemiFuture<bool> stop_profile_async() override;
 
  private:

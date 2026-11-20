@@ -15,6 +15,10 @@ limitations under the License.
 
 #include "core/runtime/py_executor_impl.h"
 
+#if defined(USE_NPU)
+#include "core/platform/npu/static_kernel_manager.h"
+#endif
+
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -358,20 +362,26 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object eplb_decode_token_mask =
       optional_tensor(params.expert.eplb_decode_token_mask);
 
-  py::object hidden_obj =
-      py_executor_.attr("execute")(execution_tokens,
-                                   positions_arg,
-                                   py_metadata,
-                                   input_embedding,
-                                   py_sync,
-                                   expert_load_data,
-                                   eplb_decode_token_mask,
-                                   params.meta.is_graph_warmup,
-                                   py_input_batch_metadata,
-                                   py_load_sync,
-                                   params.parallel.layers_per_event,
-                                   params.parallel.draft_load_event_index,
-                                   multimodal_inputs);
+  py::object hidden_obj = py_executor_.attr("execute")(
+      execution_tokens,
+      positions_arg,
+      py_metadata,
+      input_embedding,
+      py_sync,
+      expert_load_data,
+      eplb_decode_token_mask,
+      params.meta.is_graph_warmup,
+      py_input_batch_metadata,
+      py_load_sync,
+      params.parallel.layers_per_event,
+      params.parallel.draft_load_event_index,
+      multimodal_inputs,
+#if defined(USE_NPU)
+      npu::StaticKernelManager::get_instance().is_collecting()
+#else
+      false
+#endif
+  );
   if (py::isinstance(hidden_obj, py_draft_proposal_output_type_)) {
     ModelOutput output;
     output.draft_proposal_token_ids =

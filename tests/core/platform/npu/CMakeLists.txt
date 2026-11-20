@@ -1,5 +1,27 @@
 include(cc_test)
 
+cc_test(
+  NAME
+    super_kernel_test
+  SRCS
+    super_kernel_test.cpp
+  DEPS
+    :platform_npu
+    GTest::gtest_main
+    glog::glog
+)
+
+cc_test(
+  NAME
+    static_kernel_test
+  SRCS
+    static_kernel_test.cpp
+  DEPS
+    :platform_npu
+    GTest::gtest_main
+    glog::glog
+)
+
 add_executable(npu_profiler_lifecycle_test
   profiler_lifecycle_test.cpp
   ${PROJECT_SOURCE_DIR}/xllm/core/platform/npu/npu_profiler.cpp

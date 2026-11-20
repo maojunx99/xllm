@@ -29,8 +29,66 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 
+#if defined(USE_NPU)
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
+#include <torch_npu/torch_npu.h>
+
+#include "core/framework/config/kernel_config.h"
+
+namespace {
+// One-shot lazy cast of a loaded [N, K] BF16 linear weight to FRACTAL_NZ
+// with [K, N] layout, gated by --enable_weight_nz. Idempotent: the
+// format check skips already-prepared weights. Matmul side sees the NZ
+// format and skips the runtime transpose (kernels/npu/matmul.cpp).
+// NOTE: MMRS (mmrs_weight_t_) and quant paths are not NZ-compatible;
+// do not enable together with fused mc2/mmrs.
+void maybe_cast_weight_nz(torch::Tensor& weight) {
+  if (!::xllm::KernelConfig::get_instance().enable_weight_nz() ||
+      !weight.defined() || weight.device().is_cpu() || weight.dim() != 2 ||
+      weight.element_size() != 2) {
+    return;
+  }
+  int64_t format;
+#ifdef TORCH_HIGHER_THAN_PTA6
+  format = at_npu::native::get_npu_format(weight);
+#else
+  format = at_npu::native::NPUNativeFunctions::get_npu_format(weight);
+#endif
+  if (format == ACL_FORMAT_FRACTAL_NZ) {
+    return;
+  }
+  // CANN's NZ MatMul rejects N=1 or K=1. Retain the supported ND path
+  // for these weights instead of padding their logical dimensions.
+  if (weight.size(0) == 1 || weight.size(1) == 1) {
+    return;
+  }
+  // Lazy conversion can run on the shared expert's auxiliary stream. Keep
+  // the old storage alive until its asynchronous transpose has consumed it.
+  c10_npu::NPUCachingAllocator::recordStream(weight.storage().data_ptr(),
+                                             c10_npu::getCurrentNPUStream());
+  weight.set_data(at_npu::native::npu_format_cast(
+      weight.transpose(0, 1).contiguous(), ACL_FORMAT_FRACTAL_NZ));
+}
+}  // namespace
+#endif
+
 namespace xllm {
 namespace layer {
+
+#if defined(USE_NPU)
+torch::Tensor linear_with_weight_nz(const torch::Tensor& input,
+                                    torch::Tensor& weight,
+                                    const std::optional<torch::Tensor>& bias) {
+  maybe_cast_weight_nz(weight);
+  xllm::kernel::MatmulParams params;
+  params.a = input;
+  params.b = weight;
+  params.bias = bias;
+  return xllm::kernel::matmul(params);
+}
+#endif
 
 namespace {
 
@@ -623,6 +681,9 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(
 
 torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
   input = input.to(device_);
+#if defined(USE_NPU)
+  maybe_cast_weight_nz(weight_);
+#endif
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
   torch::Tensor output;
@@ -1206,6 +1267,9 @@ QKVParallelLinearImpl::QKVParallelLinearImpl(
 
 torch::Tensor QKVParallelLinearImpl::forward(torch::Tensor input) {
   input = input.to(device_);
+#if defined(USE_NPU)
+  maybe_cast_weight_nz(weight_);
+#endif
   auto bias =
       bias_.defined() ? std::optional<torch::Tensor>(bias_) : std::nullopt;
 
@@ -1676,6 +1740,9 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
 
   const bool skip_scatter =
       use_fc1_reduce && fc1_ctx && is_sequence_sharded(*fc1_ctx);
+#if defined(USE_NPU)
+  maybe_cast_weight_nz(weight_);
+#endif
 
   torch::Tensor output;
   if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
@@ -2123,7 +2190,9 @@ torch::Tensor ReplicatedLinearImpl::forward(torch::Tensor input) {
         input, weight_, weight_scale.value(), bias, input.scalar_type());
 #endif
   }
-#if defined(USE_MUSA)
+#if defined(USE_NPU)
+  return linear_with_weight_nz(input, weight_, bias);
+#elif defined(USE_MUSA)
   return musa::matmul_forward(input, weight_, bias, matmul_output_buffer_);
 #else
   xllm::kernel::MatmulParams matmul_params;

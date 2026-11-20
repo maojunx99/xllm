@@ -2055,6 +2055,121 @@ TEST_P(LinearStateWindowTest, ExhaustionPreservesSourceAndRollsBackKvGrowth) {
       0u);
 }
 
+TEST_P(LinearStateWindowTest, DecodeKeepsPublishedPrefillCheckpointReadOnly) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    auto manager = make_manager();
+    Sequence sequence = make_sequence(0, std::vector<int32_t>(5, 7), overlap);
+    ASSERT_TRUE(manager->allocate_sequence(&sequence, 4));
+    finish_input(sequence, 4);
+    const int32_t checkpoint_id = sequence.get_linear_state_slot_id();
+    ASSERT_TRUE(manager->allocate_sequence(&sequence, 5));
+    finish_input(sequence, 5);
+    const int32_t live_id = sequence.get_linear_state_slot_id();
+    sequence.append_token(8);
+
+    ASSERT_TRUE(manager->allocate_sequence(&sequence, sequence.num_tokens()));
+    const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(blocks.front().id(), live_id);
+    if (GetParam()) {
+      EXPECT_NE(blocks.back().id(), checkpoint_id);
+      Sequence consumer = make_sequence(1, std::vector<int32_t>(5, 7));
+      manager->allocate_shared_for_sequence(&consumer);
+      EXPECT_EQ(consumer.kv_cache_tokens_num(), 4u);
+      EXPECT_EQ(consumer.get_linear_state_slot_id(), checkpoint_id);
+      manager->deallocate_for_sequence(&consumer);
+    } else {
+      EXPECT_EQ(blocks.back().id(), checkpoint_id);
+    }
+    manager->deallocate_for_sequence(&sequence);
+  }
+}
+
+TEST_P(LinearStateWindowTest, DecodeSharedWindowRequiresPrivateWriteSlot) {
+  for (const uint32_t window_size : {1u, 2u}) {
+    for (const bool exhausted : {false, true}) {
+      SCOPED_TRACE(window_size);
+      SCOPED_TRACE(exhausted);
+      LinearStateBlockManager manager(linear_options(
+          exhausted ? window_size + 1 : window_size + 2, 4, GetParam()));
+      Sequence sequence = make_sequence(0, {7, 7, 7, 7, 7});
+      finish_input(sequence, 5);
+      sequence.append_token(8);
+      sequence.kv_state().add_blocks(BlockType::LINEAR,
+                                     manager.allocate(window_size));
+      const int32_t source_id = sequence.get_linear_state_slot_id();
+      Block checkpoint = sequence.kv_state().blocks(BlockType::LINEAR).front();
+
+      std::optional<std::vector<Block>> allocated =
+          manager.allocate_for_sequence(
+              &sequence, sequence.kv_state(), sequence.num_tokens());
+      if (exhausted) {
+        EXPECT_FALSE(allocated.has_value());
+        EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR),
+                  window_size);
+        EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+      } else {
+        ASSERT_TRUE(allocated.has_value());
+        ASSERT_EQ(allocated->size(), 1u);
+        EXPECT_NE(allocated->front().id(), checkpoint.id());
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  source_id);
+      }
+      sequence.reset();
+    }
+  }
+}
+
+TEST_P(LinearStateWindowTest, PrefillExhaustionCannotWriteSharedSourceInPlace) {
+  LinearStateBlockManager manager(linear_options(2, 4, GetParam()));
+  Sequence sequence = make_sequence(0, std::vector<int32_t>(9, 7));
+  sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(1));
+  finish_input(sequence, 4);
+  Block checkpoint = sequence.kv_state().blocks(BlockType::LINEAR).front();
+  EXPECT_FALSE(manager.allocate_for_sequence(&sequence, sequence.kv_state(), 8)
+                   .has_value());
+  EXPECT_EQ(sequence.get_linear_state_slot_id(), checkpoint.id());
+  sequence.reset();
+}
+
+TEST_P(LinearStateWindowTest, PreservedDecodeCheckpointUsesPrivateWriteSlot) {
+  for (const bool overlap : {false, true}) {
+    for (const bool exhausted : {false, true}) {
+      SCOPED_TRACE(overlap);
+      SCOPED_TRACE(exhausted);
+      BlockManager::Options options =
+          linear_options(exhausted ? 3 : 4, 4, GetParam(), true, 0, true);
+      options.enable_schedule_overlap(overlap);
+      LinearStateBlockManager manager(options);
+      Sequence sequence = make_sequence(0, {7, 7, 7}, overlap);
+      finish_input(sequence, 3);
+      sequence.append_token(8);
+      finish_input(sequence, 4);
+      sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(2));
+      const Slice<Block> before = sequence.kv_state().blocks(BlockType::LINEAR);
+      const int32_t checkpoint_id = before[overlap ? 0 : 1].id();
+      Block shared_write = before[overlap ? 1 : 0];
+      std::optional<std::vector<Block>> allocated =
+          manager.allocate_for_sequence(
+              &sequence, sequence.kv_state(), sequence.num_tokens());
+      if (exhausted) {
+        EXPECT_FALSE(allocated.has_value());
+        EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+      } else {
+        ASSERT_TRUE(allocated.has_value());
+        ASSERT_EQ(allocated->size(), 1u);
+        EXPECT_NE(allocated->front().id(), shared_write.id());
+        ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+        EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+                  checkpoint_id);
+      }
+      sequence.reset();
+    }
+  }
+}
+
 TEST_P(LinearStateWindowTest, DecodeRollingExhaustionFallsBackToCurrentSource) {
   auto manager = make_manager(3, 32);
   Sequence sequence = make_sequence(0, {7, 7, 7});

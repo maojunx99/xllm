@@ -13,12 +13,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <glog/logging.h>
 #include <torch_npu/csrc/aten/CustomFunctions.h>
 
-#include "npu_ops_api.h"
-#include "ops_npu/npu_ops.h"
+#include "core/kernels/npu/npu_ops_api.h"
 
 namespace xllm::kernel::npu {
+
+torch::Tensor apply_npu_moe_finalize_routing(
+    const torch::Tensor& expanded_tokens,
+    const torch::Tensor& probabilities,
+    const torch::Tensor& expanded_row_ids) {
+  CHECK_EQ(expanded_tokens.dim(), 2);
+  CHECK_EQ(probabilities.dim(), 2);
+  CHECK_EQ(expanded_tokens.size(0), probabilities.numel());
+  CHECK_EQ(expanded_row_ids.numel(), probabilities.numel());
+  // Mode 3 consumes row-major gather indices and skips -1 routes. Its 3D
+  // input uses flat row offsets; this view preserves the dropless FFN buffer.
+  const auto expanded_view = expanded_tokens.view(
+      {probabilities.size(1), probabilities.size(0), expanded_tokens.size(1)});
+  return at_npu::native::custom_ops::npu_moe_finalize_routing(
+      expanded_view,
+      /*skip1=*/std::nullopt,
+      /*skip2=*/std::nullopt,
+      /*bias=*/std::nullopt,
+      probabilities,
+      expanded_row_ids,
+      /*export_for_source_row=*/std::nullopt,
+      /*drop_pad_mode=*/3);
+}
 
 torch::Tensor apply_npu_moe_token_unpermute(
     const torch::Tensor& permuted_tokens,

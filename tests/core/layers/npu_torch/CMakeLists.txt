@@ -113,3 +113,16 @@ target_link_options(npu_linear_w8a8_dynamic_test PRIVATE
   "-Wl,--whole-archive"
   "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
   "-Wl,--no-whole-archive")
+
+cc_test(
+  NAME npu_shared_expert_overlap_test
+  SRCS shared_expert_overlap_test.cpp tests_utils.cpp
+  DEPS :npu_torch_layers :common_layers :parallel_state :model :state_dict
+       :xllm_ops glog::glog torch GTest::gtest_main
+)
+target_link_libraries(npu_shared_expert_overlap_test PRIVATE
+                      ascendcl hccl c_sec nnopbase atb)
+target_link_options(npu_shared_expert_overlap_test PRIVATE
+  "-Wl,--whole-archive"
+  "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+  "-Wl,--no-whole-archive")

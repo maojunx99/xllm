@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 import torch.nn as nn
@@ -64,6 +65,18 @@ from xllm.python.model_executor.runners.decode_cuda_graph import (
     _CAPTURE_WARMUP_STEPS,
     _decode_bucket,
 )
+
+
+@contextmanager
+def _super_kernel_scope(enabled: bool) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+    torch.npu.super_kernel_scope_begin("xllm_model")
+    try:
+        yield
+    finally:
+        torch.npu.super_kernel_scope_end("xllm_model")
 
 
 def _require_positive_execution_counts(execution_counts: Sequence[int]) -> None:
@@ -286,6 +299,8 @@ class DecodeAclGraphRunner(BaseRunner):
         is_spec_draft: bool = False,
         draft_query_width: int = 1,
         eplv2_graph_token_limit: int | None = None,
+        enable_super_kernel: bool = False,
+        super_kernel_auto_op_parallel: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
@@ -309,6 +324,8 @@ class DecodeAclGraphRunner(BaseRunner):
         # sequences for the max_seqs_per_batch check.
         self._draft_query_width = max(1, int(draft_query_width))
         self._eplv2_graph_token_limit = eplv2_graph_token_limit
+        self._enable_super_kernel = enable_super_kernel
+        self._super_kernel_auto_op_parallel = super_kernel_auto_op_parallel
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
@@ -2657,8 +2674,20 @@ class DecodeAclGraphRunner(BaseRunner):
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
         )
-        with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
+        with (
+            forward_context(context),
+            torch.npu.graph(entry.graph, stream=self._stream),
+            _super_kernel_scope(self._enable_super_kernel),
+        ):
             entry.static_output = self._forward_static(entry)
+        if self._enable_super_kernel:
+            entry.graph.super_kernel_optimize(
+                optimize_options={
+                    "dcci_after_kernel_end": [".*"],
+                    "auto_op_parallel": int(self._super_kernel_auto_op_parallel),
+                }
+            )
+            logger.info("SuperKernel graph optimization completed for Python ACL decode graph")
         entry.graph_tasks = capture_context.tasks
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> ModelExecutionOutput:

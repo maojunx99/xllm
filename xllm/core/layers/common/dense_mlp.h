@@ -47,6 +47,11 @@ class DenseMLPImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states);
 
+  // Staged execution preserves each linear's quantization and FC1 behavior.
+  torch::Tensor forward_gate_up(const torch::Tensor& hidden_states);
+  torch::Tensor forward_activation(const torch::Tensor& gate_up);
+  torch::Tensor forward_down(const torch::Tensor& activation);
+
   void load_state_dict(const StateDict& state_dict);
   void load_state_dict(const StateDict& state_dict,
                        const std::vector<std::string>& gate_up_name,

@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/platform/static_kernel_ops.h"
 #include "framework/model/model_input_params.h"
 
 namespace xllm::layer {
@@ -102,8 +103,8 @@ void ExpandedDecodeMetadataBuilder::populate(ModelInputParams& target,
       expand_host_kv_seq_lens(source_host_kv_seq_lens);
   torch::Tensor expanded_kv_seq_lens =
       torch::stack({kv_seq_lens - 1, kv_seq_lens}, /*dim=*/1).flatten();
-  torch::Tensor expanded_block_tables =
-      source_block_tables.repeat_interleave(/*repeats=*/2, /*dim=*/0);
+  torch::Tensor expanded_block_tables = static_kernel::repeat_interleave(
+      source_block_tables, /*repeats=*/2, /*dim=*/0);
   populate_expanded_layout(target,
                            expanded_kv_seq_lens,
                            expanded_block_tables,

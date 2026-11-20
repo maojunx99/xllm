@@ -61,6 +61,16 @@ class SpeculativeEngineBase : public Engine {
 
   bool start_profile() override { return engine_->start_profile(); }
 
+  std::vector<std::string> static_kernel_control(
+      const std::string& command) override {
+    auto reports = engine_->static_kernel_control(command);
+    if (draft_model_initialized_) {
+      auto draft_reports = draft_engine_->static_kernel_control(command);
+      reports.insert(reports.end(), draft_reports.begin(), draft_reports.end());
+    }
+    return reports;
+  }
+
   bool stop_profile() override { return engine_->stop_profile(); }
 
   const TokenizerArgs& tokenizer_args() const override {

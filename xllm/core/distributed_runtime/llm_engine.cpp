@@ -1745,6 +1745,23 @@ bool LLMEngine::start_profile() {
   return true;
 }
 
+std::vector<std::string> LLMEngine::static_kernel_control(
+    const std::string& command) {
+  CHECK(!worker_clients_.empty());
+  std::vector<folly::SemiFuture<std::string>> futures;
+  futures.reserve(worker_clients_.size());
+  for (auto& worker : worker_clients_) {
+    futures.emplace_back(worker->static_kernel_control_async(command));
+  }
+  auto results = folly::collectAll(futures).get();
+  std::vector<std::string> reports;
+  reports.reserve(results.size());
+  for (const auto& result : results) {
+    reports.emplace_back(result.value());
+  }
+  return reports;
+}
+
 bool LLMEngine::stop_profile() {
   LOG(INFO) << "Stopping profiler on " << worker_clients_num_ << " worker(s).";
   if (worker_clients_.empty()) {

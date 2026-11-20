@@ -122,6 +122,11 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
 }
 
 torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
+  return forward_down(forward_activation(forward_gate_up(hidden_states)));
+}
+
+torch::Tensor DenseMLPImpl::forward_gate_up(
+    const torch::Tensor& hidden_states) {
   const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
   const bool use_fc1_sequence_parallel =
       apply_fc1_sequence_parallel_ && fc1_ctx && is_sequence_sharded(*fc1_ctx);
@@ -144,13 +149,13 @@ torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
     gate_up = gate_up_proj_->forward(h);
   }
 
-  if (is_smoothquant_) {
-    if (use_fc1_sequence_parallel) {
-      return down_proj_->forward(gate_up,
-                                 row_parallel_reduce_mode_for_fc1(*fc1_ctx));
-    }
+  return gate_up;
+}
 
-    return down_proj_->forward(gate_up);
+torch::Tensor DenseMLPImpl::forward_activation(const torch::Tensor& gate_up) {
+  // SmoothQuant's Down wrapper owns the fused activation/quantization.
+  if (is_smoothquant_) {
+    return gate_up;
   }
 
   torch::Tensor output;
@@ -161,13 +166,19 @@ torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
         gate_up.options());
   }
 
-  act_->forward(gate_up, output);
+  torch::Tensor input = gate_up;
+  act_->forward(input, output);
+  return output;
+}
 
-  if (use_fc1_sequence_parallel) {
-    return down_proj_->forward(output,
+torch::Tensor DenseMLPImpl::forward_down(const torch::Tensor& activation) {
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+  if (apply_fc1_sequence_parallel_ && fc1_ctx &&
+      is_sequence_sharded(*fc1_ctx)) {
+    return down_proj_->forward(activation,
                                row_parallel_reduce_mode_for_fc1(*fc1_ctx));
   }
-  return down_proj_->forward(output);
+  return down_proj_->forward(activation);
 }
 
 void DenseMLPImpl::load_state_dict(const StateDict& state_dict) {

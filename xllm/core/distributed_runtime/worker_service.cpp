@@ -899,6 +899,18 @@ void WorkerService::StartProfile(::google::protobuf::RpcController* controller,
   return;
 }
 
+void WorkerService::StaticKernelControl(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::StaticKernelControlRequest* req,
+    proto::StaticKernelControlResponse* resp,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, req, resp, done]() {
+    brpc::ClosureGuard done_guard(done);
+    resp->set_result(
+        worker_->static_kernel_control_async(req->command()).get());
+  });
+}
+
 void WorkerService::StopProfile(::google::protobuf::RpcController* controller,
                                 const proto::Empty* req,
                                 proto::Status* resp,

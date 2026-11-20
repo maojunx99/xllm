@@ -134,6 +134,9 @@ class LLMEngine : public Engine {
 
   bool start_profile() override;
 
+  std::vector<std::string> static_kernel_control(
+      const std::string& command) override;
+
   bool stop_profile() override;
 
   // XTensor mode: get GlobalXTensor offsets for allocated blocks via RPC

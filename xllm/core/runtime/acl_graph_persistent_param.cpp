@@ -412,6 +412,13 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
     return;
   }
 
+  // Regular Torch decode uses operator-owned PA/FIA graph tasks. Keep the
+  // external CustomPagedAttention context only for legacy and MTP consumers.
+  if (KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&
+      !options_.enable_speculative_decode()) {
+    return;
+  }
+
   initialize_paged_attention_plan_context(device);
 }
 
@@ -960,6 +967,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   CHECK_GT(padded_num_tokens, 0) << "padded_num_tokens must be > 0";
   const uint32_t actual_num_tokens = tokens.size(0);
   const bool is_decode = params.meta.batch_forward_type.is_decode();
+  // Torch decode captures an updatable PA/FIA task. Its operator owns tiling;
+  // the separate CustomPagedAttention plan remains for legacy/MTP consumers.
+  const bool uses_attention_task_update =
+      is_decode && !params.is_spec_verify &&
+      KernelConfig::get_instance().npu_kernel_backend() == "TORCH";
   const bool is_chunked_prefill =
       params.meta.batch_forward_type.is_chunked_prefill();
   const bool is_hybrid_spec_verify_chunked_prefill =
@@ -1360,7 +1372,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
               persistent_host_q_seq_lens_.begin());
   }
 
-  if (uses_paged_attention_tiling() && update_paged_attention_plan) {
+  if (uses_paged_attention_tiling() && update_paged_attention_plan &&
+      !uses_attention_task_update) {
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
     if (k_cache.defined() && v_cache.defined() && k_cache.numel() > 0 &&

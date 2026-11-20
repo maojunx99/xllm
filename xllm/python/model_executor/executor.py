@@ -351,6 +351,9 @@ class ModelExecutor:
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
         graph_backend = _resolve_graph_backend(config)
+        enable_super_kernel = bool(config.get("enable_super_kernel", False))
+        if enable_super_kernel and (not bool(config.get("enable_static_kernel", False)) or graph_backend != "aclgraph"):
+            raise ValueError("SuperKernel requires static kernels and the NPU ACL graph backend")
         adapter_factory = getattr(model, "create_decode_graph_adapter", None)
         graph_adapter = (
             adapter_factory(config, graph_backend, is_spec_draft=is_spec_draft) if adapter_factory is not None else None
@@ -463,6 +466,8 @@ class ModelExecutor:
                 enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False) and not glm_eplv2),
                 is_spec_draft=is_spec_draft,
                 draft_query_width=int(config.get("draft_query_width", 1) or 1),
+                enable_super_kernel=enable_super_kernel,
+                super_kernel_auto_op_parallel=bool(config.get("super_kernel_auto_op_parallel", False)),
                 **eplv2_graph_kwargs,
             )
             self.decode_graph_runner.bind_execution_metadata_builders(execution_metadata_builders)
@@ -609,6 +614,7 @@ class ModelExecutor:
         layers_per_event: int = 1,
         draft_load_event_index: int | None = None,
         multimodal_inputs: MultimodalInputs | None = None,
+        force_eager: bool = False,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -648,7 +654,8 @@ class ModelExecutor:
         restore_history = self._restore_engram_history
         graph_runner = self.decode_graph_runner
         if (
-            graph_runner is not None
+            not force_eager
+            and graph_runner is not None
             and multimodal_inputs is None
             and (eplb is None or current_platform.is_npu())
             and graph_runner.can_execute(input_ids, metadata, input_embedding)
@@ -681,7 +688,7 @@ class ModelExecutor:
             return output
         if restore_history is not None:
             restore_history(self.attention_backend, metadata)
-        if self.inductor_runner is not None:
+        if self.inductor_runner is not None and not force_eager:
             # Compiled execution must not capture request-specific Host events.
             if layer_load_context is not None:
                 layer_load_context.synchronize_all_layers()

@@ -22,6 +22,8 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
+#include "core/kernels/npu/paged_attention_graph_operation.h"
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
@@ -110,6 +112,14 @@ struct FusedInferAttentionGraphTask {
   std::shared_ptr<c10_npu::NPUEvent> event;
 };
 
+struct PagedAttentionGraphTask {
+  std::shared_ptr<kernel::npu::PagedAttentionGraphOperation> operation;
+  int64_t batch_size = 0;
+  uint64_t capture_order = 0;
+  c10_npu::NPUTaskGroupHandle handle{};
+  std::shared_ptr<c10_npu::NPUEvent> event;
+};
+
 class AclGraphTaskUpdateContext final {
  public:
   void begin_capture() {
@@ -117,6 +127,8 @@ class AclGraphTaskUpdateContext final {
     next_capture_order = 0;
     causal_conv1d_tasks.clear();
     fused_infer_attention_tasks.clear();
+    paged_attention_tasks.clear();
+    paged_attention_workspace = torch::Tensor();
     fused_infer_attention_workspace_signature.reset();
     fused_infer_attention_workspace = torch::Tensor();
   }
@@ -127,6 +139,8 @@ class AclGraphTaskUpdateContext final {
   uint64_t next_capture_order = 0;
   std::vector<CausalConv1dGraphTask> causal_conv1d_tasks;
   std::vector<FusedInferAttentionGraphTask> fused_infer_attention_tasks;
+  std::vector<PagedAttentionGraphTask> paged_attention_tasks;
+  torch::Tensor paged_attention_workspace;
   std::optional<FusedInferAttentionWorkspaceSignature>
       fused_infer_attention_workspace_signature;
   torch::Tensor fused_infer_attention_workspace;

@@ -388,6 +388,16 @@ folly::SemiFuture<bool> RemoteWorker::start_profile_async() {
   return future;
 }
 
+folly::SemiFuture<std::string> RemoteWorker::static_kernel_control_async(
+    const std::string& command) {
+  folly::Promise<std::string> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this, command, promise = std::move(promise)]() mutable {
+    promise.setValue(channel_->static_kernel_control(command));
+  });
+  return future;
+}
+
 folly::SemiFuture<bool> RemoteWorker::stop_profile_async() {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();

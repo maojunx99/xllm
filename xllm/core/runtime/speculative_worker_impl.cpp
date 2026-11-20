@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_shape.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/speculative/spec_input_builder.h"
+#include "core/platform/static_kernel_ops.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/vlm_worker_impl.h"
 #include "util/slice.h"
@@ -32,11 +33,11 @@ limitations under the License.
 namespace xllm {
 
 namespace {
-#define TENSOR_REPEAT(tensor_, repeats)                                       \
-  do {                                                                        \
-    tensor_ = tensor_.defined()                                               \
-                  ? tensor_.repeat_interleave(/*repeats=*/repeats, /*dim=*/0) \
-                  : tensor_;                                                  \
+#define TENSOR_REPEAT(tensor_, repeats)                                        \
+  do {                                                                         \
+    tensor_ = tensor_.defined() ? static_kernel::repeat_interleave(            \
+                                      tensor_, /*repeats=*/repeats, /*dim=*/0) \
+                                : tensor_;                                     \
   } while (0)
 
 Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
@@ -415,7 +416,8 @@ void SpeculativeWorkerImpl::update_sampling_params(
     if (!tensor.defined()) {
       return;
     }
-    tensor = tensor.repeat_interleave(repeats_tensor, /*dim=*/0);
+    tensor =
+        static_kernel::repeat_interleave(tensor, repeats_tensor, /*dim=*/0);
   };
   repeat_per_seq(sampling_params.frequency_penalties);
   repeat_per_seq(sampling_params.presence_penalties);

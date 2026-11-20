@@ -193,6 +193,8 @@ class WorkerImpl {
   // for now; on other backends these are no-ops returning false.
   virtual bool start_profile();
 
+  std::string static_kernel_control(const std::string& command);
+
   virtual bool stop_profile();
 
   virtual folly::SemiFuture<bool> pull_kv_blocks_async(
